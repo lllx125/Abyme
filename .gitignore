@@ -49,6 +49,9 @@ checkpoints/
 data/
 datasets/
 
+# SFT training data
+abyme-rllm/sft/training_data.jsonl
+
 # Logs and outputs
 logs/
 *.log

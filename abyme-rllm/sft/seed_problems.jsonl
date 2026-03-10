@@ -1,9 +1,0 @@
-{"category": "Algebraic Equation Solving", "problem": "Solve for x: 2^(x+1) + 2^(x-1) = 10"}
-{"category": "Algebraic Equation Solving", "problem": "Determine x: √(x+8) - √(x) = 2"}
-{"category": "Algebraic Equation Solving", "problem": "Find x satisfying: (x²-9)/(x-3) = 2x + 1"}
-{"category": "Differential Calculus", "problem": "Determine the intervals of concavity and inflection points for f(x) = ln(x^2 + 4)."}
-{"category": "Differential Calculus", "problem": "A water tank has the shape of an inverted cone with height 10 m and base radius 4 m. Water is pumped in at 2 m³/min. How fast is the water level rising when the water is 5 m deep?"}
-{"category": "Differential Calculus", "problem": "Find the derivative of f(x) = arctan(√(1 + x^2) - x) and simplify your answer as much as possible."}
-{"category": "Integral Calculus", "problem": "Evaluate the integral: ∫ (x^3 * sin(x^2)) dx using substitution and integration by parts."}
-{"category": "Integral Calculus", "problem": "Compute the definite integral: ∫_0^π/2 sin^3(x) * cos^2(x) dx using trigonometric identities and reduction formulas."}
-{"category": "Integral Calculus", "problem": "Find the value of ∫ (e^x * sin(x)) dx by applying integration by parts twice and solving for the integral recursively."}

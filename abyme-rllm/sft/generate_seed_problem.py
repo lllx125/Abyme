@@ -2,19 +2,13 @@ import os
 import json
 import re
 from typing import List, Tuple
-from openai import OpenAI
 from dotenv import load_dotenv
+from abyme.model import deepseek
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Initialize OpenAI client for DeepSeek API
-client = OpenAI(
-    api_key=os.environ.get("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
-
-
+OUTPUT_FILE = "data/seed_problems.jsonl"
 
 
 def generate_seed_problems(problems_per_category: int = 20, overwrite: bool = True, max_retries: int = 3, categories: List[str] = []) -> List[Tuple[str, str]]:
@@ -53,7 +47,7 @@ Category: {category}
 Number of problems: {n}"""
 
     all_problems = []
-    output_file = "seed_problems.jsonl"
+    output_file = OUTPUT_FILE
 
     # Create output directory if needed
     output_dir = os.path.dirname(output_file)
@@ -73,6 +67,12 @@ Number of problems: {n}"""
 
     failed_categories = []
 
+    # Initialize DeepSeek model once for all categories
+    model = deepseek(
+        reasoning=False,
+        system_prompt="You are a helpful assistant that generates educational problems. Always respond with valid JSON."
+    )
+
     for category_idx, category in enumerate(categories):
         print(f"[{category_idx + 1}/{len(categories)}] Generating {category} problems...")
 
@@ -85,19 +85,8 @@ Number of problems: {n}"""
                     category=category.replace('_', ' ')
                 )
 
-                # Call DeepSeek API
-                response = client.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant that generates educational problems. Always respond with valid JSON."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.8,
-                    max_tokens=4096
-                )
-
-                # Parse the response
-                content = response.choices[0].message.content
+                # Call DeepSeek API using the model
+                content = model.generate(prompt, max_attempt=1)
                 if not content:
                     print(f"  Attempt {attempt + 1}/{max_retries}: Empty response from API.")
                     if attempt < max_retries - 1:
@@ -225,5 +214,4 @@ if __name__ == "__main__":
         "Dietary Restriction Menu Planning", "Personal Budget Allocation", "Tax Deduction Categorization",
         "Library Classification Logic", "Journalistic Fact-Checking", "Cryptic Crossword Solving", "Riddle Deconstruction"
     ]
-    
     generate_seed_problems(categories=categories, overwrite=False, problems_per_category=10, max_retries=3)
