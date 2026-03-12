@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Abyme Visualizer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body class="bg-gray-900 text-white h-screen overflow-hidden">
+    <div class="flex h-full">
+        <!-- Left: Chat Panel (30%) -->
+        <div class="w-1/3 bg-gray-800 flex flex-col border-r border-gray-700">
+            <!-- Header -->
+            <div class="p-4 border-b border-gray-700">
+                <h1 class="text-xl font-bold">Abyme Visualizer</h1>
+                <p class="text-sm text-gray-400">Real-time recursive reasoning</p>
+            </div>
+
+            <!-- Messages -->
+            <div id="messages" class="flex-1 overflow-y-auto p-4 space-y-4">
+                <div class="text-center text-gray-500 text-sm mt-8">
+                    Enter a problem below to start visualization
+                </div>
+            </div>
+
+            <!-- Input -->
+            <div class="p-4 border-t border-gray-700">
+                <textarea
+                    id="prompt-input"
+                    class="w-full bg-gray-700 text-white rounded p-3 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    rows="4"
+                    placeholder="Enter your problem or question here..."></textarea>
+
+                <!-- Configuration Sliders -->
+                <div class="mt-3 space-y-3 pb-3 border-b border-gray-700">
+                    <!-- Max Depth Slider -->
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <label for="max-depth-slider" class="text-xs text-gray-400">Max Depth</label>
+                            <span id="max-depth-value" class="text-xs font-mono text-blue-400">5</span>
+                        </div>
+                        <input
+                            type="range"
+                            id="max-depth-slider"
+                            min="1"
+                            max="10"
+                            value="5"
+                            class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer slider"
+                        />
+                    </div>
+
+                    <!-- Max Call Slider -->
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <label for="max-call-slider" class="text-xs text-gray-400">Max Calls</label>
+                            <span id="max-call-value" class="text-xs font-mono text-blue-400">100</span>
+                        </div>
+                        <input
+                            type="range"
+                            id="max-call-slider"
+                            min="10"
+                            max="500"
+                            step="10"
+                            value="100"
+                            class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer slider"
+                        />
+                    </div>
+                </div>
+
+                <div class="flex items-center justify-between mt-3">
+                    <div class="text-xs text-gray-500">
+                        <span id="connection-status" class="inline-block w-2 h-2 rounded-full bg-gray-500 mr-1"></span>
+                        <span id="connection-text">Connecting...</span>
+                    </div>
+                    <div class="flex space-x-2">
+                        <button
+                            id="stop-btn"
+                            class="hidden bg-red-600 hover:bg-red-700 px-4 py-2 rounded font-medium transition-colors">
+                            Stop
+                        </button>
+                        <button
+                            id="send-btn"
+                            class="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-6 py-2 rounded font-medium transition-colors">
+                            Send
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right: Tree Visualization (70%) -->
+        <div class="flex-1 flex flex-col bg-gray-900 relative">
+            <!-- Stats Bar -->
+            <div class="p-4 border-b border-gray-700">
+                <div id="stats" class="flex items-center space-x-6 text-sm">
+                    <div>
+                        <span class="text-gray-400">Calls:</span>
+                        <span id="call-count" class="font-mono font-bold">0</span>
+                    </div>
+                    <div>
+                        <span class="text-gray-400">Depth:</span>
+                        <span id="current-depth" class="font-mono font-bold">0</span>
+                        <span class="text-gray-500">/</span>
+                        <span id="max-depth" class="font-mono">5</span>
+                    </div>
+                    <div class="flex-1"></div>
+                    <div>
+                        <span class="text-gray-400">Status:</span>
+                        <span id="status" class="font-medium">Ready</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- D3 Tree Canvas -->
+            <div id="tree-container" class="flex-1 relative overflow-hidden">
+                <svg id="tree-svg" class="w-full h-full"></svg>
+
+                <!-- Legend -->
+                <div class="absolute bottom-4 right-4 bg-gray-800 border border-gray-700 rounded p-3 text-sm">
+                    <div class="font-bold mb-2">Legend</div>
+                    <div class="space-y-1">
+                        <div class="flex items-center space-x-2">
+                            <div class="w-4 h-4 rounded-full bg-yellow-500"></div>
+                            <span class="text-gray-300">Generating</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <div class="w-4 h-4 rounded-full bg-orange-500"></div>
+                            <span class="text-gray-300">Waiting</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <div class="w-4 h-4 rounded-full bg-blue-500"></div>
+                            <span class="text-gray-300">Complete</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <div class="w-4 h-4 rounded-full bg-green-500"></div>
+                            <span class="text-gray-300">Final</span>
+                        </div>
+                        <div class="flex items-center space-x-2 mt-2 pt-2 border-t border-gray-700">
+                            <div class="w-8 h-0.5 bg-gray-400"></div>
+                            <span class="text-gray-300">Subproblem</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <svg class="w-8 h-4" viewBox="0 0 32 16">
+                                <line x1="0" y1="8" x2="24" y2="8" stroke="#6B7280" stroke-width="3"/>
+                                <path d="M 24,8 L 18,4 L 18,12 Z" fill="#6B7280"/>
+                            </svg>
+                            <span class="text-gray-300">Continuation</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Empty state -->
+                <div id="empty-state" class="absolute inset-0 flex items-center justify-center text-gray-600">
+                    <div class="text-center">
+                        <svg class="w-16 h-16 mx-auto mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z"></path>
+                        </svg>
+                        <p class="text-lg">No active generation</p>
+                        <p class="text-sm mt-1">Tree will appear here when you send a prompt</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Node Details Sidebar -->
+            <div id="node-sidebar" class="hidden absolute top-0 right-0 w-96 h-full bg-gray-800 border-l border-gray-700 shadow-2xl z-50 flex-col">
+                <!-- Sidebar Header -->
+                <div class="p-4 border-b border-gray-700 flex items-center justify-between">
+                    <h2 class="text-lg font-bold text-blue-400">Node Details</h2>
+                    <button
+                        id="close-sidebar-btn"
+                        class="text-gray-400 hover:text-white transition-colors"
+                        onclick="treeViz.hideSidebar()">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                    </button>
+                </div>
+
+                <!-- Sidebar Content -->
+                <div id="sidebar-content" class="flex-1 overflow-y-auto p-4">
+                    <!-- Content will be inserted by JavaScript -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hover Tooltip -->
+    <div id="tooltip" class="hidden absolute bg-gray-800 border border-gray-600 rounded shadow-xl max-w-2xl z-50 pointer-events-none">
+        <div class="p-4">
+            <div class="font-bold text-blue-400 mb-3">Node Details</div>
+            <div id="tooltip-content" class="text-sm space-y-2"></div>
+        </div>
+    </div>
+
+    <!-- Loading Scripts -->
+    <script src="/static/js/tree.js"></script>
+    <script src="/static/js/chat.js"></script>
+    <script src="/static/js/main.js"></script>
+</body>
+</html>

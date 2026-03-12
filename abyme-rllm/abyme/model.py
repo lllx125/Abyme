@@ -3,12 +3,14 @@ import os
 from openai import OpenAI
 from typing import Callable, List, Optional, Dict, Any
 from dotenv import load_dotenv
-from .utils import extract_elaborations, replace_elaborations_with_responses, format_output, default_context_formatter, verify_format
+from .utils import extract_delegations, replace_delegations_with_responses, format_output, default_formatter, verify_format
 from .tree_trace import TreeTraceNode
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import torch
+
+# Lazy import torch - only needed for HuggingFaceModel
+# This allows lightweight usage with OpenAI/DeepSeek models
 
 # Load environment variables from .env file
 load_dotenv()
@@ -36,18 +38,18 @@ class Model(ABC):
     
 class RecursiveModel(Model):
     """
-    A recursive model wrapper that implements elaboration-based problem decomposition.
+    A recursive model wrapper that implements delegation-based problem decomposition.
 
     This model wraps a base Model and enables recursive generation by:
-    1. Detecting <elaborate>...</elaborate> tags in model output
-    2. Recursively solving each elaboration as a sub-problem
-    3. Replacing elaborations with their solutions and continuing generation
+    1. Detecting <delegate>...</delegate> tags in model output
+    2. Recursively solving each delegation as a sub-problem
+    3. Replacing delegations with their solutions and continuing generation
 
     The recursive process allows the model to:
     - Break complex problems into simpler sub-problems
-    - Solve sub-problems independently with full context
+    - Solve sub-problems independently with full fragment
     - Integrate sub-solutions back into the main reasoning flow
-    - Continue generation with enhanced context from solved sub-problems
+    - Continue generation with enhanced fragment from solved sub-problems
     - Process sub-problems in parallel (when max_parallel_workers > 1)
 
     **Safety Constraints:**
@@ -58,7 +60,7 @@ class RecursiveModel(Model):
     **Trace Recording:**
     - Uses TreeTraceNode to record the entire generation tree
     - Access via last_generation_trace() for debugging and analysis
-    - Tracks: prompts, contexts, depths, outputs, latencies, and subproblem relationships
+    - Tracks: prompts, fragments, depths, outputs, latencies, and subproblem relationships
 
     **Error Handling and Partial Traces:**
     - All errors propagate to the root and are re-raised
@@ -68,77 +70,16 @@ class RecursiveModel(Model):
     - No continuation (next) is created if any subproblem fails
     - This allows inspection of what succeeded before failure occurred
 
-    Example partial trace on error:
-    ```python
-    try:
-        result = recursive_model.generate("Complex problem", max_attempt=1)
-    except Exception as e:
-        # Even though generation failed, partial trace is available
-        trace = recursive_model.last_generation_trace()
-        # trace.subproblems contains all successfully completed subproblems
-        # trace.next is None (no continuation created after failure)
-        print(f"Completed {len(trace.subproblems)} subproblems before failure")
-    ```
-
-    **Example Usage:**
-    ```python
-    base_model = OpenAIModel(...)
-    recursive_model = RecursiveModel(
-        base_model=base_model,
-        max_depth=3,              # Allow up to 3 levels of recursion
-        max_call=20,              # Allow up to 20 total model calls
-        max_parallel_workers=4    # Process up to 4 subproblems concurrently
-    )
-
-    result = recursive_model.generate("Solve 5*5 + 3*3", max_attempt=3)
-    trace = recursive_model.last_generation_trace()  # Get generation tree
-    ```
-
-    **Example Recursive Flow:**
-    ```
-    Problem: "Solve 5*5 + 3*3"
-
-    Call 1: Node(prompt="Solve 5*5 + 3*3", context="", depth=0)
-      -> Model generates: "Let me break this down <elaborate>5*5</elaborate> <elaborate>3*3</elaborate>"
-      -> Extract elaborations: ["5*5", "3*3"]
-      -> Depth: 0, Calls used: 1
-
-    Call 2: Node(prompt="5*5", context="", depth=1)  [parallel with Call 3]
-      -> Model generates: "25"
-      -> No elaborations found
-      -> Stores final_output: "25"
-      -> Depth: 1, Calls used: 2
-
-    Call 3: Node(prompt="3*3", context="", depth=1)  [parallel with Call 2]
-      -> Model generates: "9"
-      -> No elaborations found
-      -> Stores final_output: "9"
-      -> Depth: 1, Calls used: 3
-
-    Back to Call 1:
-      -> Replace elaborations with responses
-      -> Reconstructed: "Let me break this down <response>25</response> <response>9</response>"
-
-    Call 4: Node(prompt="Solve 5*5 + 3*3",
-                 context="Let me break this down <response>25</response> <response>9</response>",
-                 depth=0)
-      -> Model generates: "So 25 + 9 = 34"
-      -> No elaborations found
-      -> Stores final_output: "So 25 + 9 = 34"
-      -> Depth: 0, Calls used: 4
-
-    Total calls: 4
-    Final result: "So 25 + 9 = 34"
-    Tree structure: root -> [sub1, sub2] -> next -> final
-    ```
     """
 
     def __init__(self,
                  base_model: Model,
+                 guard_model: Optional[Model] = None,
                  max_depth: int = 20,
                  max_call: int = 50,
                  max_parallel_workers: int = 1,
-                 context_formatter: Callable[[str, str], str] = default_context_formatter,
+                 max_subproblem_retry: int = 2,
+                 formatter: Callable[[str, str, str], str] = default_formatter,
                  print_progress: bool = False
                  ):
         """
@@ -146,24 +87,29 @@ class RecursiveModel(Model):
 
         Args:
             base_model: The underlying Model to use for generation.
-                       Must implement generate_with_context(prompt, context, max_attempt).
+            guard_model: The non-recursive Model to use when max recursion depth is reached.
             max_depth: Maximum recursion depth allowed. Prevents infinite recursion.
-                      Each elaboration increases depth by 1.
+                      Each delegation increases depth by 1.
             max_call: Maximum total number of model calls allowed across all recursion levels.
                      Prevents resource exhaustion from too many API calls.
             max_parallel_workers: Maximum number of parallel workers for recursive generation.
-            context_formatter: Function to format prompt and context into a single string for the base model.
+            max_subproblem_retry: Maximum number of retry attempts for each subproblem generation.
+                                 Defaults to 1 (no retry).
+            formatter: Function to format prompt and fragment into a single string for the base model.
+            print_progress: Whether to print the generation to the console
         """
         self.base_model = base_model
+        self.guard_model = guard_model
         self.max_depth = max_depth
         self.max_call = max_call
         self.max_parallel_workers = max_parallel_workers
+        self.max_subproblem_retry = max_subproblem_retry
         self.call_count = 0  # Tracks total calls across all recursion levels
-        self.context_formatter = context_formatter
+        self.formatter = formatter
         self.print_progress = print_progress
         self.trace = TreeTraceNode("","",0)  # Store the trace of the last generation for debugging
-        self._worker_semaphore = threading.Semaphore(max_parallel_workers)  # Global semaphore to limit concurrent workers
-        self._call_count_lock = threading.Lock()  # Lock for thread-safe call count updates
+        self.main_problem = ""  # Store the main problem prompt for context in subproblems
+
 
     def generate(self, prompt: str, max_attempt: int = 1) -> str:
         """
@@ -185,7 +131,7 @@ class RecursiveModel(Model):
             max_attempt: Maximum number of retry attempts if generation fails
 
         Returns:
-            The final generated response string with all elaborations resolved
+            The final generated response string with all delegations resolved
 
         Raises:
             Exception: If the final attempt fails (after all retries exhausted)
@@ -195,13 +141,13 @@ class RecursiveModel(Model):
             >>> result = model.generate("Solve problem X", max_attempt=3)
             # If first 2 attempts hit max_call, 3rd attempt will retry
         """
-
+        self.main_problem = prompt
         # Try up to max_attempt times, catching exceptions
         last_error = None
         for _ in range(max_attempt):
             try:
                 self.call_count = 0
-                root = TreeTraceNode(prompt=prompt, context="", depth=0)
+                root = TreeTraceNode(prompt=prompt, fragment="", depth=0)
                 self._recursive_generate(root)
                 self.trace = root  # Store the trace for debugging
                 return root.get_final_output()  # Success, return immediately
@@ -215,25 +161,25 @@ class RecursiveModel(Model):
 
     def _recursive_generate(self, node: TreeTraceNode):
         """
-        Recursively generate output by solving elaborations as sub-problems.
+        Recursively generate output by solving delegations as sub-problems.
 
-        This implements the core recursive elaboration algorithm using TreeTraceNode
+        This implements the core recursive delegation algorithm using TreeTraceNode
         for tracking the entire generation tree.
 
         **Generation Process:**
         1. **Safety Checks**: Verify depth and call limits not exceeded
-        2. **Generate**: Call base model with node's prompt and context
-        3. **Extract Elaborations**: Check for <elaborate>...</elaborate> tags
-        4. **Base Case**: If no elaborations, set node.final_output and return
+        2. **Generate**: Call base model with node's prompt and fragment
+        3. **Extract delegations**: Check for <delegate>...</delegate> tags
+        4. **Base Case**: If no delegations, set node.final_output and return
         5. **Recursive Case**:
-           a. Recursively solve each elaboration as independent sub-problem
+           a. Recursively solve each delegation as independent sub-problem
            b. Create child TreeTraceNode for each subproblem
-           c. Replace elaboration tags with <response>sub_solution</response>
-           d. Create continuation node with updated context (depth unchanged)
+           c. Replace delegation tags with <response>sub_solution</response>
+           d. Create continuation node with updated fragment (depth unchanged)
            e. Link continuation node as node.next
 
         **Key Design Decisions:**
-        - Sub-problems are solved with empty context (independent reasoning)
+        - Sub-problems are solved with empty fragment (independent reasoning)
         - Sub-problems increase depth by 1 (prevent infinite nesting)
         - Continuation call keeps same depth (not a new sub-problem)
         - Call count is global across all recursion levels
@@ -242,7 +188,7 @@ class RecursiveModel(Model):
         Args:
             node: TreeTraceNode containing:
                   - prompt: The current problem to solve
-                  - context: Previously generated text
+                  - fragment: Previously generated text
                   - depth: Current recursion depth (0 = top level)
 
         Returns:
@@ -257,40 +203,43 @@ class RecursiveModel(Model):
             >>> # Internal recursive flow
             >>> root = TreeTraceNode("Solve X+Y", "", 0)
             >>> _recursive_generate(root)
-            # Generates: "I need <elaborate>X</elaborate> and <elaborate>Y</elaborate>"
+            # Generates: "I need <delegate>X</delegate> and <delegate>Y</delegate>"
             # Creates child nodes for "X" and "Y" at depth 1
             # Replaces: "I need <response>5</response> and <response>3</response>"
             # Creates continuation node at depth 0
             # Final output via root.get_final_output(): "So X+Y = 8"
         """
         
-        
         # Safety check: Prevent infinite recursion
         if node.depth > self.max_depth:
-            raise Exception("Maximum recursion depth reached.")
-
-        # Safety check: Prevent resource exhaustion (thread-safe)
-        with self._call_count_lock:
-            if self.call_count >= self.max_call:
-                raise Exception("Maximum call count reached.")
-            # Increment global call counter
-            self.call_count += 1
+            if not self.guard_model:
+                raise Exception("Maximum recursion depth reached.")
+            else:
+                try:
+                    output = self._guarded_generate_with_formatter(node, model=self.guard_model, max_attempt=1)
+                except Exception as e:
+                    raise Exception(f"Error in base model generation: {e}")
+                
+                node.final_output = format_output(output)
+                return node
+            
 
         # Generate output using base model (retries up to 3 times internally)
         try:
-            output = self._guarded_generate_with_context(node, max_attempt=3)
+            output = self._guarded_generate_with_formatter(node,model=self.base_model, max_attempt=1)
         except Exception as e:
             raise Exception(f"Error in base model generation: {e}")
 
-        # Extract any elaboration tags from the output
-        subproblems = extract_elaborations(output)
 
-        # Base case: No elaborations found, return output directly
-        if not subproblems:
+        # Base case: answer is generated
+        if "</think>" in output:
             node.final_output = format_output(output)
             return node
+        
+        # Extract any delegation tags from the output
+        subproblems = extract_delegations(output)
 
-        # Recursive case: Solve each elaboration as a sub-problem
+        # Recursive case: Solve each delegation as a sub-problem
         sub_responses: List[str] = []
 
         if self.max_parallel_workers == 1:
@@ -304,31 +253,32 @@ class RecursiveModel(Model):
             except Exception as e:
                 raise Exception(f"Error in parallel sub-problem generation: {e}")
 
-        # Replace all <elaborate>...</elaborate> tags with <response>...</response>
-        reconstructed_output = replace_elaborations_with_responses(output, sub_responses)
+        # Replace all <delegate>...</delegate> tags with <response>...</response>
+        reconstructed_output = replace_delegations_with_responses(output, sub_responses)
 
-        # Continue generation with updated context
+        # Continue generation with updated fragment
         # - Same prompt (still solving the original problem)
-        # - Updated context (now includes resolved sub-problems)
+        # - Updated fragment (now includes resolved sub-problems)
         # - Same depth (this is continuation, not a new sub-problem)
         try:
-            newnode = TreeTraceNode(prompt=node.prompt, context=reconstructed_output, depth=node.depth)
-            node.next = self._recursive_generate(newnode)
+            newnode = TreeTraceNode(prompt=node.prompt, fragment=node.fragment+"\n\n"+reconstructed_output, depth=node.depth)
+            node.next = newnode
+            self._recursive_generate(newnode)
             return node
         except Exception as e:
             raise Exception(f"Error continuing generation: {e}")
     
-    def _guarded_generate_with_context(self, node: TreeTraceNode, max_attempt: int) -> str:
+    def _guarded_generate_with_formatter(self, node: TreeTraceNode, model: Model, max_attempt: int) -> str:
         """
-        Helper method to call base model's generate_with_context with retries.
+        Helper method to call base model's generate_with_formatter with retries.
 
-        This method wraps the base model's generate_with_context in a retry loop:
+        This method wraps the base model's generate_with_formatter in a retry loop:
         - Tries up to max_attempt times
         - Catches exceptions and retries
         - If all attempts fail, raises the last exception
 
         Args:
-            node: The TreeTraceNode instance containing prompt, context, and depth
+            node: The TreeTraceNode instance containing prompt, fragment, and depth
             max_attempt: Maximum number of retry attempts if generation fails
 
         Returns:
@@ -337,16 +287,20 @@ class RecursiveModel(Model):
         Raises:
             Exception: If all attempts fail, raises the last encountered exception
         """
+
+        self.call_count += 1
+            
         last_error = None
         for _ in range(max_attempt):
             try:
                 start_time = time.time()
-                response = self.base_model.generate(self.context_formatter(node.prompt, node.context), max_attempt=1)
+                context = node.parent.prompt if node.parent else "None"
+                response = model.generate(self.formatter(node.prompt, context, node.fragment), max_attempt=1)
                 if not verify_format(response):
-                    raise Exception("Invalid format detected in response.")
+                    raise Exception(f"Invalid format detected in response. output:{ response }")
                 node.record_generation(response, latency=time.time()-start_time)
                 if self.print_progress:
-                    print(f"{'{'}\n\"prompt\":\"{node.prompt}\"\n\"context\":\"{node.context}\"\n\"output\":\"{response}\"\n{'}'}\ndepth: {node.depth}\nlatency: {node.latency}\n{'='*50}")
+                    print(f"{'{'}\n\"prompt\":\"{node.prompt}\"\n\"context\":\"{context}\"\n\"fragment\":\"{node.fragment}\"\n\"output\":\"{response}\"\n{'}'}\ndepth: {node.depth}\nlatency: {node.latency}\ncall: {self.call_count}\n{'='*50}")
                 return response
             except Exception as e:
                 last_error = e
@@ -360,12 +314,12 @@ class RecursiveModel(Model):
         This method processes each sub-problem one after another:
         - Checks call count before each sub-problem (thread-safe)
         - Creates child TreeTraceNode for each subproblem
-        - Solves sub-problem with empty context and increased depth
+        - Solves sub-problem with empty fragment and increased depth
         - Adds completed subproblem node to parent's subproblems list
         - Collects responses in order
 
         Args:
-            subproblems: List of sub-problem strings extracted from elaborations
+            subproblems: List of sub-problem strings extracted from delegations
             node: Parent TreeTraceNode to attach subproblem nodes to
 
         Returns:
@@ -376,14 +330,18 @@ class RecursiveModel(Model):
         """
         responses = []
         for sub in subproblems:
-            # Thread-safe call count check
-            with self._call_count_lock:
-                if self.call_count >= self.max_call:
-                    raise Exception("Maximum call count reached.")
             try:
-                newnode = TreeTraceNode(prompt=sub, context="", depth=node.depth + 1)
-                self._recursive_generate(newnode)
+                newnode = TreeTraceNode(prompt=sub, fragment="", depth=node.depth + 1)
                 node.add_subproblem(newnode)
+                for i in range(self.max_subproblem_retry):
+                    try:
+                        self._recursive_generate(newnode)
+                        break  # Success, break out of retry loop
+                    except Exception as e:
+                        if i == self.max_subproblem_retry:
+                            raise Exception(f"Sub-problem generation failed after {self.max_subproblem_retry} attempts: {e}")
+                        continue  # Retry on exception
+                
                 responses.append(newnode.get_final_output())
             except Exception as e:
                 raise Exception(f"Error solving sub-problem '{sub}': {e}")
@@ -391,93 +349,96 @@ class RecursiveModel(Model):
     
     def _parallel_subproblem_generate(self, subproblems: List[str], node: TreeTraceNode) -> List[str]:
         """
-        Helper method to solve sub-problems in parallel.
+        Helper method to solve sub-problems in parallel using asyncio + ThreadPoolExecutor.
 
-        This method processes multiple sub-problems concurrently while ensuring
-        the total number of concurrent workers across all recursion levels does
-        not exceed max_parallel_workers.
+        This method avoids thread pool starvation by using asyncio to manage task dependencies
+        while ThreadPoolExecutor handles the actual work with max_parallel_workers limit.
 
-        Key features:
-        - Uses ThreadPoolExecutor to manage parallel execution
-        - Uses semaphore to limit total concurrent workers globally
-        - Each worker acquires semaphore before processing, releases after
-        - Handles nested parallelism: child subproblems also respect the worker limit
-        - Maintains order of responses to match order of subproblems
-
-        Implementation details:
-        - Thread pool size is larger than max_parallel_workers to avoid deadlock
-          (threads can wait on semaphore without blocking the pool)
-        - Semaphore wraps the entire _recursive_generate call for each subproblem
-        - This ensures nested parallel calls also count toward the worker limit
+        Key design:
+        - asyncio manages waiting (doesn't block threads while waiting for children)
+        - ThreadPoolExecutor performs actual work (limited by max_parallel_workers)
+        - Parents can wait for children without occupying threads
+        - No deadlocks: threads are released back to pool while waiting
 
         Args:
-            subproblems: List of sub-problem strings extracted from elaborations
-            node: Current TreeTraceNode
+            subproblems: List of sub-problem strings extracted from delegations
+            node: Parent TreeTraceNode to attach subproblem nodes to
 
         Returns:
-            List of responses corresponding to each sub-problem (in order)
+            List of responses corresponding to each sub-problem (in original order)
 
         Raises:
-            Exception: If maximum call count is exceeded or if any sub-problem fails
+            Exception: If any sub-problem fails during generation
         """
-        def solve_subproblem(sub: str, index: int):
+        import asyncio
+        import concurrent.futures
+
+        async def process_subproblem(sub: str, executor_ref) -> tuple:
             """
-            Worker function to solve a single subproblem with semaphore control.
+            Process a single subproblem asynchronously.
 
-            The semaphore ensures that across all recursion levels, at most
-            max_parallel_workers are actively processing subproblems concurrently.
+            Returns tuple of (node, response) to maintain order.
             """
-            # Acquire semaphore to limit concurrent workers
-            self._worker_semaphore.acquire()
-            try:
-                # Check call count before processing (thread-safe)
-                with self._call_count_lock:
-                    if self.call_count >= self.max_call:
-                        raise Exception("Maximum call count reached.")
+            loop = asyncio.get_running_loop()
 
-                # Create and process the subproblem node
-                newnode = TreeTraceNode(prompt=sub, context="", depth=node.depth + 1)
-                self._recursive_generate(newnode)
-                return (index, newnode, newnode.get_final_output())
-            except Exception as e:
-                # Re-raise with context about which subproblem failed
-                raise Exception(f"Error solving sub-problem '{sub}': {e}")
-            finally:
-                # Always release semaphore, even if an exception occurred
-                self._worker_semaphore.release()
+            # Create the child node
+            newnode = TreeTraceNode(prompt=sub, fragment="", depth=node.depth + 1)
 
-        # Initialize responses dictionary to maintain order
-        responses_dict: dict[int, str] = {}
+            # Add node to parent immediately before recursive call
+            node.add_subproblem(newnode)
 
-        # Use ThreadPoolExecutor to manage parallel execution
-        # Pool size is larger than max_parallel_workers to avoid deadlock:
-        # - Some threads may be waiting on the semaphore
-        # - Other threads need to be available to process nested subproblems
-        # - This allows child subproblems to run even when parent threads are waiting
-        pool_size = max(len(subproblems), self.max_parallel_workers * 2)
-
-        with ThreadPoolExecutor(max_workers=pool_size) as executor:
-            # Submit all subproblems to the thread pool
-            futures = {executor.submit(solve_subproblem, sub, i): i
-                      for i, sub in enumerate(subproblems)}
-
-            # Collect results as they complete
-            for future in as_completed(futures):
+            # Retry logic for subproblem generation
+            last_error = None
+            for attempt in range(self.max_subproblem_retry):
                 try:
-                    index, newnode, response = future.result()
-                    responses_dict[index] = response
-                    node.add_subproblem(newnode)
+                    # Execute the recursive generation in the thread pool
+                    # This is where the actual blocking work happens
+                    # The thread is ONLY occupied during this execution
+                    await loop.run_in_executor(
+                        executor_ref,
+                        self._recursive_generate,
+                        newnode
+                    )
+                    break  # Success, exit retry loop
                 except Exception as e:
-                    # If any subproblem fails, cancel remaining futures
-                    for f in futures:
-                        f.cancel()
-                    raise e
+                    last_error = e
+                    if attempt == self.max_subproblem_retry - 1:
+                        raise Exception(f"Sub-problem generation failed after {self.max_subproblem_retry} attempts: {e}")
+                    continue  # Retry on exception
 
-        # Convert dictionary back to ordered list
-        return [responses_dict[i] for i in range(len(subproblems))]
-    
-    
-    
+            # Get the final output
+            response = newnode.get_final_output()
+
+            return newnode, response
+
+        async def process_all_subproblems(executor_ref):
+            """Process all subproblems concurrently and maintain order."""
+            # Create tasks for all subproblems
+            tasks = [process_subproblem(sub, executor_ref) for sub in subproblems]
+
+            # Wait for all to complete (maintains order)
+            # gather() ensures all children complete before parent moves on
+            # Because this is 'await', it yields control - no threads are blocked here!
+            results = await asyncio.gather(*tasks)
+
+            # Unpack results (nodes already added to parent before recursive calls)
+            responses = []
+            for newnode, response in results:
+                responses.append(response)
+
+            return responses
+
+        # Create thread pool executor with max_parallel_workers limit
+        # This enforces the global concurrency limit
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_parallel_workers) as executor:
+            # Run the async function
+            try:
+                responses = asyncio.run(process_all_subproblems(executor))
+                return responses
+            except Exception as e:
+                raise Exception(f"Error in parallel sub-problem generation: {e}")
+
+
 class OpenAIModel(Model):
     """OpenAI-compatible model implementation."""
 
@@ -596,7 +557,7 @@ class HuggingFaceModel(Model):
         model_name: str,
         system_prompt: str = "You are a helpful AI assistant.",
         device: Optional[str] = None,
-        torch_dtype: Optional[torch.dtype] = None,
+        torch_dtype: Optional[Any] = None,  # torch.dtype when torch is available
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
         trust_remote_code: bool = False,
@@ -647,10 +608,11 @@ class HuggingFaceModel(Model):
         """
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
+            import torch
         except ImportError:
             raise ImportError(
                 "HuggingFace transformers library is required. "
-                "Install with: pip install transformers"
+                "Install with: pip install transformers torch"
             )
 
         self.model_name = model_name
@@ -862,29 +824,115 @@ class HuggingFaceModel(Model):
         }
 
 
-# DeepSeek model instances
-def deepseek(reasoning: bool = False, system_prompt:str = "You are a helpful AI assistant.") -> OpenAIModel:
-    """
-    Factory function to create a DeepSeek model instance.
+class DeepSeekModel(Model):
+    """DeepSeek model implementation using OpenAI-compatible API."""
 
-    Args:
-        reasoning: If True, creates a DeepSeek Reasoner model; otherwise, creates a DeepSeek Chat model.
+    def __init__(
+        self,
+        reasoning: bool = False,
+        system_prompt: str = "You are a helpful AI assistant."
+    ):
+        """
+        Initialize DeepSeek model.
 
-    Returns:
-        An instance of OpenAIModel configured for the specified DeepSeek model.
-    """
-    if reasoning:
-        return OpenAIModel(
-            model_name="deepseek-reasoner",
-            api_key=os.getenv("DEEPSEEK_API_KEY", ""),
-            base_url="https://api.deepseek.com",
-            system_prompt=system_prompt
+        Args:
+            reasoning: If True, uses deepseek-reasoner; otherwise uses deepseek-chat
+            system_prompt: System prompt to use for all generations
+        """
+        self.model_name = "deepseek-reasoner" if reasoning else "deepseek-chat"
+        self.api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        self.base_url = "https://api.deepseek.com"
+        self.system_prompt = system_prompt
+
+        # Initialize OpenAI client for DeepSeek
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url
         )
-    else:
-        return OpenAIModel(
-            model_name="deepseek-chat",
-            api_key=os.getenv("DEEPSEEK_API_KEY", ""),
-            base_url="https://api.deepseek.com",
-            system_prompt=system_prompt
-        )
 
+    def generate(self, prompt: str, max_attempt: int = 1) -> str:
+        """
+        Generate a response using the DeepSeek API with retry mechanism.
+
+        Args:
+            prompt: The user prompt
+            max_attempt: Maximum number of retry attempts on failure (default: 1)
+
+        Returns:
+            The generated response
+
+        Raises:
+            Exception: If all attempts fail
+        """
+        last_error = None
+        for _ in range(max_attempt):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                content = response.choices[0].message.content
+                return content if content is not None else ""
+            except Exception as e:
+                last_error = e
+                continue
+
+        raise Exception(f"All {max_attempt} attempts failed. Last error: {last_error}")
+
+
+class GPTModel(Model):
+    """GPT-5 model implementation using the new responses API."""
+
+    def __init__(
+        self,
+        system_prompt: str = "You are a helpful AI assistant."
+    ):
+        """
+        Initialize GPT-5 model.
+
+        Args:
+            system_prompt: System prompt to use for all generations
+        """
+        self.system_prompt = system_prompt
+        # OpenAI client automatically loads API key from OPENAI_API_KEY environment variable
+        self.client = OpenAI()
+
+    def generate(self, prompt: str, max_attempt: int = 1) -> str:
+        """
+        Generate a response using the GPT-5 responses API with retry mechanism.
+
+        Args:
+            prompt: The user prompt
+            max_attempt: Maximum number of retry attempts on failure (default: 1)
+
+        Returns:
+            The generated response
+
+        Raises:
+            Exception: If all attempts fail
+        """
+        last_error = None
+        for _ in range(max_attempt):
+            try:
+                response = self.client.responses.create(
+                    model="gpt-5",
+                    input=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                # Extract content from the response
+                content = response.output_text if hasattr(response, 'output_text') else str(response)
+                return content if content is not None else ""
+            except Exception as e:
+                last_error = e
+                continue
+
+        raise Exception(f"All {max_attempt} attempts failed. Last error: {last_error}")
+    
+class ErrorGuardModel(Model):
+    def generate(self, prompt: str, max_retry:int) -> str:
+        return "You reached recursion limit, you must solve this problem your self and delegate no further"

@@ -183,6 +183,45 @@ def run_benchmark(
     return scores
 
 
+def score_result(result_file_path: str) -> Tuple[float, List[float]]:
+    """
+    Read scores from a result JSONL file and calculate average score.
+
+    Args:
+        result_file_path: Path to the result JSONL file containing 'score' fields
+
+    Returns:
+        Tuple of (average_score, score_list)
+        - average_score: Mean of all scores in the file
+        - score_list: List of all individual scores
+
+    Raises:
+        FileNotFoundError: If result file does not exist
+        ValueError: If file is empty or contains no valid scores
+    """
+    result_path = Path(result_file_path)
+
+    if not result_path.exists():
+        raise FileNotFoundError(f"Result file does not exist: {result_path}")
+
+    scores = []
+
+    with result_path.open('r') as f:
+        for line in f:
+            if not line.strip():
+                continue
+
+            json_data = json.loads(line.strip())
+            if 'score' in json_data:
+                scores.append(json_data['score'])
+
+    if not scores:
+        raise ValueError(f"No valid scores found in {result_path}")
+
+    average_score = sum(scores) / len(scores)
+    return average_score, scores
+
+
 def generate_summary_file(
     results: Dict[str, List[float]],
     benchmark_configs: List[Dict[str, Any]],
@@ -316,14 +355,25 @@ def run_all_benchmark(
             for config in benchmark_configs
         }
 
-        # Collect results as they complete
+        # Wait for all tasks to complete
         for future in as_completed(future_to_config):
             config = future_to_config[future]
             task_name = config.get('task_name') or config['input_jsonl_path']
 
             try:
-                scores = future.result()
+                # Wait for benchmark to complete
+                future.result()
+
+                # Read scores from the result file using score_result function
+                if results_folder:
+                    result_file = Path(results_folder) / config['output_jsonl_path']
+                else:
+                    result_file = Path(config['output_jsonl_path'])
+
+                avg_score, scores = score_result(str(result_file))
                 results[task_name] = scores
+                print(f"\n{task_name}: Average score = {avg_score:.4f} ({len(scores)} problems)")
+
             except Exception as e:
                 print(f"\nError in task '{task_name}': {e}")
                 results[task_name] = []

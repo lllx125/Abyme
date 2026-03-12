@@ -9,9 +9,9 @@ import json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Callable
 from datasets import load_dataset
-from abyme.model import Model, deepseek
+from abyme.model import Model, DeepSeekModel
 from abyme.core import Abyme_DeepSeek
-from run_benchmark import pass_at_k, run_all_benchmark
+from run_benchmark import pass_at_k, run_all_benchmark, score_result
 
 def normalize_aime_data(dataset) -> List[Dict]:
     """
@@ -326,8 +326,8 @@ def run_aime_benchmark(
     """
     # Create models
     print("Initializing models...")
-    DeepSeek_Base = deepseek(reasoning=False)
-    DeepSeek_Reasoning = deepseek(reasoning=True)
+    DeepSeek_Base = DeepSeekModel(reasoning=False)
+    DeepSeek_Reasoning = DeepSeekModel(reasoning=True)
     Abyme_DeepSeek_Base = Abyme_DeepSeek(
         reasoning=False,
         max_parallel_workers=6,
@@ -412,8 +412,14 @@ if __name__ == "__main__":
         print(f"AIME dataset found at {data_path}")
 
     # Run the benchmark
-    print("\nStarting AIME benchmark...")
-    run_aime_benchmark(
-        results_folder="results/aime_benchmark",
-        data_path=data_path
-    )
+    # print("\nStarting AIME benchmark...")
+    # run_aime_benchmark(
+    #     results_folder="results/aime_benchmark",
+    #     data_path=data_path
+    # )
+    
+    score, score_list = score_result("results/aime_benchmark/deepseek_reasoning.jsonl")
+    print(score)
+    print(score_list)
+    
+    

@@ -1,0 +1,4 @@
+#!/bin/bash
+# One-click run script
+source venv/bin/activate 2>/dev/null || (./setup.sh && source venv/bin/activate)
+python app.py

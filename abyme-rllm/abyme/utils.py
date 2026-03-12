@@ -5,19 +5,19 @@ import re
 from typing import List
 
 
-def extract_elaborations(text: str) -> List[str]:
+def extract_delegations(text: str) -> List[str]:
     """
-    Extract elaborate tags for each run
+    Extract delegate tags for each run
 
     Args:
         text: The text to search in
 
     Returns:
-        List of elaboration contents (content within tags only)
+        List of delegation contents (content within tags only)
 
     """
-    # Use regex to find all occurrences of <elaborate>...</elaborate>
-    pattern = r'<elaborate>(.*?)</elaborate>'
+    # Use regex to find all occurrences of <delegate>...</delegate>
+    pattern = r'<delegate>(.*?)</delegate>'
     contents = []
 
     for match in re.finditer(pattern, text, flags=re.DOTALL):
@@ -55,55 +55,56 @@ def format_output(text: str, full_response: bool = False, eos_token: str = "<｜
     return result
 
 
-def replace_elaborations_with_responses(text: str, responses: List[str]) -> str:
+def replace_delegations_with_responses(text: str, responses: List[str]) -> str:
     """
-    Replace all <elaborate>...</elaborate> tags with corresponding responses from the list.
+    Replace all <delegate>...</delegate> tags with corresponding responses from the list.
 
     This function is extracted from engine.py to be reusable in both the inference engine
     and the SFT data generation pipeline.
 
     Args:
-        text: The text containing <elaborate>...</elaborate> tags
-        responses: List of response strings to replace elaborations with (in order)
+        text: The text containing <delegate>...</delegate> tags
+        responses: List of response strings to replace delegations with (in order)
 
     Returns:
-        Text with all elaborations replaced by <response>...</response> tags
+        Text with all delegations replaced by <response>...</response> tags
 
     Raises:
-        ValueError: If the number of elaborations doesn't match the number of responses
+        ValueError: If the number of delegations doesn't match the number of responses
     """
-    # First, count the number of elaboration tags
-    elaborations = extract_elaborations(text)
+    # First, count the number of delegation tags
+    delegations = extract_delegations(text)
 
-    if len(elaborations) != len(responses):
+    if len(delegations) != len(responses):
         raise ValueError(
-            f"Number of elaborations ({len(elaborations)}) doesn't match "
+            f"Number of delegations ({len(delegations)}) doesn't match "
             f"number of responses ({len(responses)})"
         )
 
-    # Replace each elaboration tag with its corresponding response
-    def replace_elaboration(match):
-        idx = replace_elaboration.counter
-        replace_elaboration.counter += 1
+    # Replace each delegation tag with its corresponding response
+    def replace_delegation(match):
+        idx = replace_delegation.counter
+        replace_delegation.counter += 1
         return f'<response>{responses[idx]}\n</response>'
 
-    replace_elaboration.counter = 0
-    result = re.sub(r'<elaborate>.*?</elaborate>', replace_elaboration, text, flags=re.DOTALL)
+    replace_delegation.counter = 0
+    result = re.sub(r'<delegate>.*?</delegate>', replace_delegation, text, flags=re.DOTALL)
 
     return result
 
-def default_context_formatter(prompt: str, context: str) -> str:
+def default_formatter(prompt: str, context: str, fragment: str) -> str:
     """
-    Default context formatter that combines prompt and context.
+    Default formatter that combines prompt, context, and fragment.
 
     Args:
         prompt: The input prompt string
         context: Additional context string
+        fragment: previous answer fragment
 
     Returns:
-        Combined string of prompt and context
+        Combined string of prompt, context, and fragment
     """
-    return f"Prompt: {prompt}\nContext: {context}"
+    return f"Prompt: {prompt}\nContext: {context}\nFragment: {fragment}"
 
 def verify_format(trace: str) -> bool:
     """
@@ -118,28 +119,20 @@ def verify_format(trace: str) -> bool:
        - All tags must be complete (e.g., no "<elabo" without "rate>")
        - Detects partial or malformed tag structures
 
-    2. **No Nested <elaborate> Tags**:
-       - <elaborate> tags cannot be nested within themselves
+    2. **No Nested <delegate> Tags**:
+       - <delegate> tags cannot be nested within themselves
        - Nesting depth must never exceed 1
 
-    3. **All <elaborate> Tags Come in Pairs**:
-       - Every <elaborate> opening tag must have a matching </elaborate> closing tag
+    3. **All <delegate> Tags Come in Pairs**:
+       - Every <delegate> opening tag must have a matching </delegate> closing tag
        - Opening and closing counts must match exactly
        - Closing tags cannot appear before their corresponding opening tags
 
-    4. **No <response> Tags Allowed**:
-       - Neither <response> nor </response> tags are permitted
-       - The output should only contain elaborations, not responses
-
-    5. **No <think> Opening Tag**:
+    4. **No <think> Opening Tag**:
        - Only the closing tag </think> is allowed
        - No <think> opening tag should exist in the output
 
-    6. **Mutual Exclusivity Requirement**:
-       - The output must contain either <elaborate> tags OR a </think> tag, but NOT both
-       - At least one of these must be present
-
-    7. **</think> Appears At Most Once**:
+    5. **</think> Appears At Most Once**:
        - The closing tag </think> can appear zero or one time
        - Multiple </think> tags are not allowed
 
@@ -151,49 +144,59 @@ def verify_format(trace: str) -> bool:
 
     Examples:
         Valid outputs:
-        >>> verify_format("Solution<elaborate>sub-problem</elaborate>")
+        >>> verify_format("Solution<delegate>sub-problem</delegate>")
+        True
+        >>> verify_format("Solution<response>answer</response>")
         True
         >>> verify_format("Final answer: 42</think>")
         True
 
         Invalid outputs:
-        >>> verify_format("Test<elaborate>nested<elaborate>bad</elaborate></elaborate>")
+        >>> verify_format("Test<delegate>nested<delegate>bad</delegate></delegate>")
         False
-        >>> verify_format("Both<elaborate>test</elaborate>and</think>")  # Both elaborate and think
+        >>> verify_format("Both<delegate>test</delegate>and</think>")  # Both delegate and think
+        False
+        >>> verify_format("Both<response>test</response>and</think>")  # Both response and think
         False
         >>> verify_format("Answer</think></think>")  # Multiple </think>
         False
     """
-    # Rule 4: No <response> or </response> tags allowed
-    if '<response>' in trace or '</response>' in trace:
-        return False
 
-    # Rule 5: No <think> opening tag allowed
+    # Rule 4: No <think> opening tag allowed
     if '<think>' in trace:
         return False
 
     # Rule 1: Check for broken/incomplete tags
     broken_patterns = [
-        r'<elabo[^r]',  # Incomplete <elaborate>
-        r'</elabo[^r]',  # Incomplete </elaborate>
+        r'<elabo[^r]',  # Incomplete <delegate>
+        r'</elabo[^r]',  # Incomplete </delegate>
         r'</thin[^k]',  # Incomplete </think>
+        r'<respon[^s]',  # Incomplete <response>
+        r'</respon[^s]',  # Incomplete </response>
     ]
     for pattern in broken_patterns:
         if re.search(pattern, trace):
             return False
 
-    # Rule 3: Check <elaborate> tags are properly paired (balanced and not nested)
-    elaborate_open_count = trace.count('<elaborate>')
-    elaborate_close_count = trace.count('</elaborate>')
+    # Rule 3: Check <delegate> tags are properly paired (balanced and not nested)
+    delegate_open_count = trace.count('<delegate>')
+    delegate_close_count = trace.count('</delegate>')
 
-    if elaborate_open_count != elaborate_close_count:
+    if delegate_open_count != delegate_close_count:
+        return False
+
+    # Rule 3: Check <response> tags are properly paired
+    response_open_count = trace.count('<response>')
+    response_close_count = trace.count('</response>')
+
+    if response_open_count != response_close_count:
         return False
 
     # Rule 2: Check for nesting by tracking depth
     depth = 0
-    elaborate_pattern = re.compile(r'<elaborate>|</elaborate>')
-    for match in elaborate_pattern.finditer(trace):
-        if match.group() == '<elaborate>':
+    delegate_pattern = re.compile(r'<delegate>|</delegate>')
+    for match in delegate_pattern.finditer(trace):
+        if match.group() == '<delegate>':
             depth += 1
             if depth > 1:  # Nested opening tag
                 return False
@@ -202,21 +205,22 @@ def verify_format(trace: str) -> bool:
             if depth < 0:  # Closing before opening
                 return False
 
-    # Rule 7: </think> appears at most once
+    # Rule 2: Check <response> tags for nesting
+    depth = 0
+    response_pattern = re.compile(r'<response>|</response>')
+    for match in response_pattern.finditer(trace):
+        if match.group() == '<response>':
+            depth += 1
+            if depth > 1:  # Nested opening tag
+                return False
+        else:
+            depth -= 1
+            if depth < 0:  # Closing before opening
+                return False
+
+    # Rule 5: </think> appears at most once
     think_close_count = trace.count('</think>')
     if think_close_count > 1:
-        return False
-
-    # Rule 6: Must contain either <elaborate> or </think>, but not both, and at least one
-    has_elaborate = elaborate_open_count > 0
-    has_think_close = think_close_count > 0
-
-    # Must have at least one
-    if not has_elaborate and not has_think_close:
-        return False
-
-    # Cannot have both
-    if has_elaborate and has_think_close:
         return False
 
     return True

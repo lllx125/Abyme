@@ -1,12 +1,12 @@
 """
 Recursive engine for processing elaborate/response cycles using RecursiveModel pattern.
 """
-import torch
 from typing import List, Dict, Optional, Any
-from transformers import PreTrainedTokenizerBase, AutoModelForCausalLM, BitsAndBytesConfig
-from .tokenization import setup_model_and_tokenizer, get_stopping_token_id, inject_special_tokens
-from .model import RecursiveModel, Model, HuggingFaceModel, deepseek
-from .magic_prompt import magic_prompt
+from .model import RecursiveModel, Model, HuggingFaceModel, DeepSeekModel, GPTModel, ErrorGuardModel
+from .magic import magic_prompt, magic_formatter, magic_guard_prompt
+
+# Lazy imports - only load torch/transformers when needed for HuggingFace models
+# This allows lightweight usage with DeepSeek/GPT without installing heavy dependencies
 
 
 def AbymeHuggingFaceModel(model_name: str = "Abyme", **kwargs) -> HuggingFaceModel:
@@ -39,6 +39,11 @@ def AbymeHuggingFaceModel(model_name: str = "Abyme", **kwargs) -> HuggingFaceMod
         ...     system_prompt="You are a helpful assistant."
         ... )
     """
+    # Lazy import torch/transformers only when HuggingFace model is used
+    import torch
+    from transformers import PreTrainedTokenizerBase, AutoModelForCausalLM, BitsAndBytesConfig
+    from .tokenization import setup_model_and_tokenizer, get_stopping_token_id, inject_special_tokens
+
     # Extract model_kwargs and merge with remaining kwargs
     model_kwargs = kwargs.pop('model_kwargs', {})
 
@@ -65,15 +70,27 @@ def AbymeHuggingFaceModel(model_name: str = "Abyme", **kwargs) -> HuggingFaceMod
     )
 
 def Abyme_DeepSeek(reasoning: bool = False, max_depth: int = 20, max_call: int = 50, max_parallel_workers: int = 1, print_progress: bool = False) -> RecursiveModel:
-    base_model = deepseek(reasoning, magic_prompt)
-    context_formatter = lambda prompt, context: f"Problem: {prompt} \n User partial solution: {context}"
+    base_model = DeepSeekModel(reasoning=reasoning, system_prompt=magic_prompt)
+    guard_model = ErrorGuardModel()
+    guard_model = DeepSeekModel(reasoning=reasoning, system_prompt=magic_guard_prompt)
     return RecursiveModel(
         base_model=base_model,
-        context_formatter=context_formatter,
+        guard_model=guard_model,
+        formatter=magic_formatter,
         max_depth=max_depth,
         max_call=max_call,
         max_parallel_workers=max_parallel_workers,
         print_progress = print_progress
     )
-    
-    
+
+
+def Abyme_GPT(max_depth: int = 20, max_call: int = 50, max_parallel_workers: int = 1, print_progress: bool = False) -> RecursiveModel:
+    base_model = GPTModel(system_prompt=magic_prompt)
+    return RecursiveModel(
+        base_model=base_model,
+        formatter=magic_formatter,
+        max_depth=max_depth,
+        max_call=max_call,
+        max_parallel_workers=max_parallel_workers,
+        print_progress = print_progress
+    )
