@@ -4,20 +4,29 @@ Utility functions for text processing and XML tag extraction.
 import re
 from typing import List
 
+AND = "do"
+OR = "try"
+RESPONSE = "response"
+THINK = "think"
+LEAF = "leaf" # not a tag, denoting node state only
 
-def extract_delegations(text: str) -> List[str]:
+VALID_TAGS = {AND, OR, RESPONSE, THINK}
+
+
+def extract_delegations(text: str, tag:str = AND) -> List[str]:
     """
     Extract delegate tags for each run
 
     Args:
         text: The text to search in
+        tag: The XML tag to extract
 
     Returns:
         List of delegation contents (content within tags only)
 
     """
-    # Use regex to find all occurrences of <delegate>...</delegate>
-    pattern = r'<delegate>(.*?)</delegate>'
+    # Use regex to find all occurrences of <tag>...</tag>
+    pattern = rf'<{tag}>(.*?)</{tag}>'
     contents = []
 
     for match in re.finditer(pattern, text, flags=re.DOTALL):
@@ -43,10 +52,10 @@ def format_output(text: str, full_response: bool = False, eos_token: str = "<｜
 
     if not full_response:
         # Find the last occurrence of </think>
-        last_think_end = result.rfind('</think>')
+        last_think_end = result.rfind(f"</{THINK}>")
         if last_think_end != -1:
             # Return everything after the final </think> tag
-            result = result[last_think_end + len('</think>'):]
+            result = result[last_think_end + len(f"</{THINK}>"):]
 
     # Remove EOS token if present at the end
     if eos_token and result.endswith(eos_token):
@@ -55,15 +64,15 @@ def format_output(text: str, full_response: bool = False, eos_token: str = "<｜
     return result
 
 
-def replace_delegations_with_responses(text: str, responses: List[str]) -> str:
+def replace_delegations_with_responses(text: str, responses: List[str], tag:str = AND) -> str:
     """
-    Replace all <delegate>...</delegate> tags with corresponding responses from the list.
+    Replace all <tag>...</tag> tags with corresponding responses from the list.
 
     This function is extracted from engine.py to be reusable in both the inference engine
     and the SFT data generation pipeline.
 
     Args:
-        text: The text containing <delegate>...</delegate> tags
+        text: The text containing <tag>...</tag> tags
         responses: List of response strings to replace delegations with (in order)
 
     Returns:
@@ -73,7 +82,7 @@ def replace_delegations_with_responses(text: str, responses: List[str]) -> str:
         ValueError: If the number of delegations doesn't match the number of responses
     """
     # First, count the number of delegation tags
-    delegations = extract_delegations(text)
+    delegations = extract_delegations(text, tag)
 
     if len(delegations) != len(responses):
         raise ValueError(
@@ -85,26 +94,64 @@ def replace_delegations_with_responses(text: str, responses: List[str]) -> str:
     def replace_delegation(match):
         idx = replace_delegation.counter
         replace_delegation.counter += 1
-        return f'<response>{responses[idx]}\n</response>'
+        return f'<{RESPONSE}>{responses[idx]}\n</{RESPONSE}>'
 
     replace_delegation.counter = 0
-    result = re.sub(r'<delegate>.*?</delegate>', replace_delegation, text, flags=re.DOTALL)
+    result = re.sub(rf'<{tag}>.*?</{tag}>', replace_delegation, text, flags=re.DOTALL)
 
     return result
 
-def default_formatter(prompt: str, context: str, fragment: str) -> str:
+def default_formatter(prompt: str, main_problem: str = "None", boss_problem: str = "None",fragment: str = "None") -> str:
     """
-    Default formatter that combines prompt, context, and fragment.
+    Default formatter that combines prompt, main_problem, boss_problem, and fragment.
 
     Args:
         prompt: The input prompt string
-        context: Additional context string
+        main_problem: The main problem string
+        boss_problem: The boss problem string
         fragment: previous answer fragment
 
     Returns:
-        Combined string of prompt, context, and fragment
+        Combined string of prompt, main_problem, boss_problem, and fragment
     """
-    return f"Prompt: {prompt}\nContext: {context}\nFragment: {fragment}"
+    return f"Prompt: {prompt}\nMain Problem: {main_problem}\nBoss Problem: {boss_problem}\nFragment: {fragment}"
+
+def _check_tag_pairing_and_nesting(trace: str, tag: str) -> bool:
+    """
+    Helper function to verify that tags are properly paired and not nested.
+
+    Args:
+        trace: The text to check
+        tag: The tag name (e.g., 'do', 'try', 'response')
+
+    Returns:
+        bool: True if tags are properly paired and not nested, False otherwise
+    """
+    open_tag = f'<{tag}>'
+    close_tag = f'</{tag}>'
+
+    # Check tags are properly paired
+    open_count = trace.count(open_tag)
+    close_count = trace.count(close_tag)
+
+    if open_count != close_count:
+        return False
+
+    # Check for nesting by tracking depth
+    depth = 0
+    tag_pattern = re.compile(rf'<{tag}>|</{tag}>')
+    for match in tag_pattern.finditer(trace):
+        if match.group() == open_tag:
+            depth += 1
+            if depth > 1:  # Nested opening tag
+                return False
+        else:
+            depth -= 1
+            if depth < 0:  # Closing before opening
+                return False
+
+    return True
+
 
 def verify_format(trace: str) -> bool:
     """
@@ -116,25 +163,28 @@ def verify_format(trace: str) -> bool:
     **Validation Rules:**
 
     1. **No Incomplete or Broken Tags**:
-       - All tags must be complete (e.g., no "<elabo" without "rate>")
+       - All tags must be complete (only valid tags allowed)
        - Detects partial or malformed tag structures
 
-    2. **No Nested <delegate> Tags**:
-       - <delegate> tags cannot be nested within themselves
-       - Nesting depth must never exceed 1
-
-    3. **All <delegate> Tags Come in Pairs**:
-       - Every <delegate> opening tag must have a matching </delegate> closing tag
-       - Opening and closing counts must match exactly
-       - Closing tags cannot appear before their corresponding opening tags
-
-    4. **No <think> Opening Tag**:
+    2. **No Opening <THINK> Tag**:
        - Only the closing tag </think> is allowed
        - No <think> opening tag should exist in the output
 
-    5. **</think> Appears At Most Once**:
-       - The closing tag </think> can appear zero or one time
-       - Multiple </think> tags are not allowed
+    3. **RESPONSE, AND and OR Tags are Paired and Not Nested**:
+       - Every opening tag must have a matching closing tag
+       - Tags cannot be nested within themselves
+       - Opening and closing counts must match exactly
+       - Closing tags cannot appear before their corresponding opening tags
+
+    4. **THINK Close Tag Appears At Most Once**:
+       - The closing tag </think> must appear at most once
+
+    5. **No Valid Tags After THINK Close Tag**:
+       - No valid tags (AND, OR, RESPONSE, THINK) should appear after </think>
+
+    6. **Only One of AND, OR, or THINK Can Appear**:
+       - At most one of AND, OR, or THINK tags can be present in the trace
+       - They are mutually exclusive
 
     Args:
         trace: The generated output text to validate
@@ -144,7 +194,7 @@ def verify_format(trace: str) -> bool:
 
     Examples:
         Valid outputs:
-        >>> verify_format("Solution<delegate>sub-problem</delegate>")
+        >>> verify_format("Solution<do>sub-problem</do>")
         True
         >>> verify_format("Solution<response>answer</response>")
         True
@@ -152,75 +202,66 @@ def verify_format(trace: str) -> bool:
         True
 
         Invalid outputs:
-        >>> verify_format("Test<delegate>nested<delegate>bad</delegate></delegate>")
+        >>> verify_format("Test<do>nested<do>bad</do></do>")
         False
-        >>> verify_format("Both<delegate>test</delegate>and</think>")  # Both delegate and think
+        >>> verify_format("Both<do>test</do>and</think>")  # Both AND and THINK
         False
-        >>> verify_format("Both<response>test</response>and</think>")  # Both response and think
+        >>> verify_format("Both<do>test</do>and<try>other</try>")  # Both AND and OR
+        False
+        >>> verify_format("Answer</think>extra content")  # Content after </think>
         False
         >>> verify_format("Answer</think></think>")  # Multiple </think>
         False
     """
 
-    # Rule 4: No <think> opening tag allowed
-    if '<think>' in trace:
+    # Rule 2: No <think> opening tag allowed
+    if f'<{THINK}>' in trace:
         return False
 
-    # Rule 1: Check for broken/incomplete tags
-    broken_patterns = [
-        r'<elabo[^r]',  # Incomplete <delegate>
-        r'</elabo[^r]',  # Incomplete </delegate>
-        r'</thin[^k]',  # Incomplete </think>
-        r'<respon[^s]',  # Incomplete <response>
-        r'</respon[^s]',  # Incomplete </response>
-    ]
-    for pattern in broken_patterns:
-        if re.search(pattern, trace):
+    # Rule 1: Check for incomplete tags - only valid tags are allowed
+    # Build patterns dynamically based on valid tags
+    for tag in VALID_TAGS:
+        # Check for incomplete opening tags (e.g., "<d" without "o>")
+        if len(tag) > 1:
+            for i in range(1, len(tag)):
+                incomplete_pattern = f'<{tag[:i]}(?![{tag[i]}])'
+                if re.search(incomplete_pattern, trace):
+                    return False
+
+        # Check for incomplete closing tags (e.g., "</d" without "o>")
+        if len(tag) > 1:
+            for i in range(1, len(tag)):
+                incomplete_pattern = f'</{tag[:i]}(?![{tag[i]}])'
+                if re.search(incomplete_pattern, trace):
+                    return False
+
+    # Rule 3: Check RESPONSE, AND, and OR tags are properly paired and not nested
+    for tag in [RESPONSE, AND, OR]:
+        if not _check_tag_pairing_and_nesting(trace, tag):
             return False
 
-    # Rule 3: Check <delegate> tags are properly paired (balanced and not nested)
-    delegate_open_count = trace.count('<delegate>')
-    delegate_close_count = trace.count('</delegate>')
-
-    if delegate_open_count != delegate_close_count:
-        return False
-
-    # Rule 3: Check <response> tags are properly paired
-    response_open_count = trace.count('<response>')
-    response_close_count = trace.count('</response>')
-
-    if response_open_count != response_close_count:
-        return False
-
-    # Rule 2: Check for nesting by tracking depth
-    depth = 0
-    delegate_pattern = re.compile(r'<delegate>|</delegate>')
-    for match in delegate_pattern.finditer(trace):
-        if match.group() == '<delegate>':
-            depth += 1
-            if depth > 1:  # Nested opening tag
-                return False
-        else:
-            depth -= 1
-            if depth < 0:  # Closing before opening
-                return False
-
-    # Rule 2: Check <response> tags for nesting
-    depth = 0
-    response_pattern = re.compile(r'<response>|</response>')
-    for match in response_pattern.finditer(trace):
-        if match.group() == '<response>':
-            depth += 1
-            if depth > 1:  # Nested opening tag
-                return False
-        else:
-            depth -= 1
-            if depth < 0:  # Closing before opening
-                return False
-
-    # Rule 5: </think> appears at most once
-    think_close_count = trace.count('</think>')
+    # Rule 4: </think> must appear at most once
+    think_close_count = trace.count(f'</{THINK}>')
     if think_close_count > 1:
+        return False
+
+    # Rule 5: No valid tags after </think> close tag
+    think_close_pos = trace.rfind(f'</{THINK}>')
+    if think_close_pos != -1:
+        content_after_think = trace[think_close_pos + len(f'</{THINK}>'):].strip()
+        # Check if there are any valid tags in the content after </think>
+        for tag in VALID_TAGS:
+            if f'<{tag}>' in content_after_think or f'</{tag}>' in content_after_think:
+                return False
+
+    # Rule 6: Only one of AND, OR, or THINK can appear at a time
+    has_think = think_close_count > 0
+    has_and = f'<{AND}>' in trace or f'</{AND}>' in trace
+    has_or = f'<{OR}>' in trace or f'</{OR}>' in trace
+
+    # Count how many of them are present
+    present_count = sum([has_think, has_and, has_or])
+    if present_count > 1:
         return False
 
     return True

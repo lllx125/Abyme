@@ -26,12 +26,27 @@ setup(
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
     install_requires=[
-        "torch>=2.0.0",
-        "transformers>=4.35.0",
-        "accelerate>=0.25.0",
-        "bitsandbytes>=0.41.0",
+        "openai>=1.0.0",
+        "python-dotenv>=1.2.2",
+        "tqdm>=4.65.0",
     ],
     extras_require={
+        "pytorch": [
+            "torch>=2.0.0",
+            "transformers>=4.35.0",
+            "accelerate>=0.25.0",
+            "bitsandbytes>=0.41.0",
+        ],
+        "sft": [
+            "torch>=2.0.0",
+            "transformers>=4.35.0",
+            "accelerate>=0.25.0",
+            "bitsandbytes>=0.41.0",
+            "datasets>=2.14.0",
+            "pandas>=2.0.0",
+            "scipy>=1.10.0",
+            "trl>=0.7.0",
+        ],
         "dev": [
             "pytest>=7.0.0",
             "black>=23.0.0",

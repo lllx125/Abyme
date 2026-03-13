@@ -1,0 +1,12 @@
+# Light requirements for Abyme (without PyTorch/HuggingFace)
+# Use this if you only need OpenAI/DeepSeek API models
+
+# Core API dependencies
+openai>=1.0.0
+python-dotenv>=1.2.2
+
+# Optional utilities
+tqdm>=4.65.0
+
+# Note: For HuggingFace local models, install full requirements:
+# pip install -r requirements.txt

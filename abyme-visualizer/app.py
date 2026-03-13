@@ -18,6 +18,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 # Thread-safe global node ID tracking
 node_id_map = {}  # Maps id(node) → uuid
 parent_map = {}   # Maps id(node) → id(parent_node)
+node_objects = {}  # Maps id(node) → node object (to check continuation relationships)
 map_lock = threading.Lock()  # Thread safety for multi-threading
 
 # Session-based generation tracking
@@ -81,6 +82,7 @@ def handle_generate(data):
     with map_lock:
         node_id_map.clear()
         parent_map.clear()
+        node_objects.clear()
 
     # Mark session as active and not stopped
     with sessions_lock:
@@ -159,29 +161,33 @@ def create_model_with_events(config, session_id):
                 raise Exception("Generation stopped by user")
         # Generate UUID for this node (thread-safe)
         node_id = str(uuid.uuid4())
+        continuation_parent_id = None
+
         with map_lock:
             node_id_map[id(node)] = node_id
+            node_objects[id(node)] = node  # Store node object reference
             parent_id = parent_map.get(id(node))
 
             # Check if this node is a continuation (someone's next)
-            # Look through all tracked nodes to find if any has this node as next
-            continuation_parent_id = None
-            for tracked_node_id, tracked_node in [(nid, n) for nid, n in node_id_map.items()]:
-                # We need to get the actual node object to check its next pointer
-                # This is tricky because we only have node IDs...
-                # Better approach: track continuation relationships explicitly
-                pass
+            # Look through all tracked nodes to find if any has this node as its next
+            for tracked_node_id, tracked_node_obj in node_objects.items():
+                if hasattr(tracked_node_obj, 'next') and tracked_node_obj.next is node:
+                    # This node is a continuation of tracked_node_obj
+                    continuation_parent_id = node_id_map.get(tracked_node_id)
+                    break
 
         # Progress logging
         prompt_preview = node.prompt[:60] + '...' if len(node.prompt) > 60 else node.prompt
         print(f'🔄 [Depth {node.depth}] Generating: {prompt_preview}')
 
         # Emit node_start event
+        # Derive context from parent's prompt (matching model.py logic)
+        context = node.parent.prompt if node.parent else "None"
         socketio.emit('node_start', {
             'node_id': node_id,
             'parent_id': parent_id,
             'prompt': node.prompt,
-            'context': node.context,
+            'context': context,
             'depth': node.depth
         })
 
@@ -192,18 +198,18 @@ def create_model_with_events(config, session_id):
                 'child_id': node_id
             })
 
+        # If this node is a continuation, emit the edge immediately
+        if continuation_parent_id:
+            socketio.emit('continuation_created', {
+                'node_id': continuation_parent_id,
+                'next_id': node_id
+            })
+
         # Call original _recursive_generate
         result = original_recursive_generate(node)
 
-        # After generation, emit continuation edge immediately if exists (thread-safe)
-        with map_lock:
-            if node.next:
-                next_id = node_id_map.get(id(node.next))
-                if next_id:
-                    socketio.emit('continuation_created', {
-                        'node_id': node_id,
-                        'next_id': next_id
-                    })
+        # Note: Continuation edge is now emitted when the next node STARTS (see above),
+        # not after it completes, so the edge appears immediately during generation
 
         # Progress logging
         output_preview = node.output[:60] + '...' if len(node.output) > 60 else node.output
@@ -246,7 +252,7 @@ def create_model_with_events(config, session_id):
         responses = []
         for sub in subproblems:
             from abyme.tree_trace import TreeTraceNode
-            newnode = TreeTraceNode(prompt=sub, context="", depth=parent_node.depth + 1)
+            newnode = TreeTraceNode(prompt=sub, fragment="", depth=parent_node.depth + 1)
 
             # Track parent relationship (thread-safe)
             with map_lock:
@@ -287,7 +293,7 @@ def create_model_with_events(config, session_id):
 
         async def process_subproblem(sub: str, executor_ref):
             loop = asyncio.get_running_loop()
-            newnode = TreeTraceNode(prompt=sub, context="", depth=parent_node.depth + 1)
+            newnode = TreeTraceNode(prompt=sub, fragment="", depth=parent_node.depth + 1)
 
             # Track parent relationship (thread-safe)
             with map_lock:
