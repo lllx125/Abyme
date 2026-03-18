@@ -1,317 +1,91 @@
 /**
- * Custom styles for Abyme Visualizer
+ * Global Styles
+ * Base styling and layout for the Abyme Visualizer
  */
 
-/* Global styles */
+/* Reset and base styles */
 * {
     margin: 0;
     padding: 0;
     box-sizing: border-box;
 }
 
-body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-        'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-        sans-serif;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
+html, body {
+    height: 100%;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: #1a1a1a;
+    color: #e0e0e0;
+    overflow: hidden;
 }
 
-/* Scrollbar styles */
-::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+/* Metrics Bar */
+.metrics-bar {
+    background-color: #2a2a2a;
+    padding: 10px 20px;
+    display: flex;
+    gap: 30px;
+    border-bottom: 1px solid #444;
+    height: 50px;
+    align-items: center;
 }
 
-::-webkit-scrollbar-track {
-    background: #1f2937;
+.metrics-item {
+    display: flex;
+    gap: 8px;
+    align-items: center;
 }
 
-::-webkit-scrollbar-thumb {
-    background: #4b5563;
-    border-radius: 4px;
+.metrics-label {
+    font-weight: 600;
+    color: #999;
+    font-size: 14px;
 }
 
-::-webkit-scrollbar-thumb:hover {
-    background: #6b7280;
-}
-
-/* Pulse animation for generating nodes */
-@keyframes pulse {
-    0% {
-        r: 25;
-        opacity: 1;
-    }
-    50% {
-        r: 35;
-        opacity: 0.5;
-    }
-    100% {
-        r: 45;
-        opacity: 0;
-    }
-}
-
-/* Fade in animation */
-@keyframes fadeIn {
-    from {
-        opacity: 0;
-        transform: translateY(10px);
-    }
-    to {
-        opacity: 1;
-        transform: translateY(0);
-    }
-}
-
-/* Smooth transitions */
-.node circle {
-    transition: fill 0.3s ease, r 0.3s ease;
-}
-
-.edge {
-    transition: opacity 0.3s ease;
-}
-
-/* Ensure edges render below nodes */
-.edge-group {
-    pointer-events: none;
-}
-
-.node {
-    cursor: pointer;
-}
-
-/* Messages fade in */
-#messages > div {
-    animation: fadeIn 0.3s ease;
-}
-
-/* Tooltip styles */
-#tooltip {
-    max-height: 80vh;
-    overflow-y: auto;
-    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
-}
-
-#tooltip::-webkit-scrollbar {
-    width: 6px;
-}
-
-/* Button hover effects */
-button:hover:not(:disabled) {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
-}
-
-button:active:not(:disabled) {
-    transform: translateY(0);
-}
-
-button {
-    transition: all 0.2s ease;
-}
-
-/* Input focus styles */
-textarea:focus {
-    outline: none;
-    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.3);
-}
-
-/* Tree container */
-#tree-container {
-    background: linear-gradient(to bottom, #111827 0%, #1f2937 100%);
-}
-
-/* SVG styles */
-#tree-svg {
-    cursor: grab;
-}
-
-#tree-svg:active {
-    cursor: grabbing;
-}
-
-/* Legend styles */
-#tree-container .absolute {
-    backdrop-filter: blur(10px);
-}
-
-/* Status indicator pulse */
-@keyframes statusPulse {
-    0%, 100% {
-        opacity: 1;
-    }
-    50% {
-        opacity: 0.5;
-    }
+.metrics-value {
+    font-weight: 700;
+    color: #fff;
+    font-size: 16px;
+    min-width: 40px;
 }
 
 .status-generating {
-    animation: statusPulse 2s ease-in-out infinite;
+    color: #FFD700;
 }
 
-/* Code/mono text overflow */
-.font-mono {
-    word-break: break-all;
-    white-space: pre-wrap;
+.status-complete {
+    color: #32CD32;
 }
 
-/* Empty state icon animation */
-#empty-state svg {
-    animation: float 3s ease-in-out infinite;
+.status-stopped {
+    color: #FF6347;
 }
 
-@keyframes float {
-    0%, 100% {
-        transform: translateY(0);
-    }
-    50% {
-        transform: translateY(-10px);
-    }
+.status-error {
+    color: #FF0000;
 }
 
-/* Loading spinner styles */
-@keyframes spin {
-    from {
-        transform: rotate(0deg);
-    }
-    to {
-        transform: rotate(360deg);
-    }
+/* Main Container */
+.main-container {
+    display: flex;
+    height: calc(100% - 50px);
+    width: 100%;
 }
 
-.animate-spin {
-    animation: spin 1s linear infinite;
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
 }
 
-/* Connection status animation */
-#connection-status {
-    transition: background-color 0.3s ease;
+::-webkit-scrollbar-track {
+    background: #2a2a2a;
 }
 
-/* Responsive adjustments */
-@media (max-width: 1024px) {
-    .w-1/3 {
-        width: 40%;
-    }
+::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 5px;
 }
 
-@media (max-width: 768px) {
-    .flex {
-        flex-direction: column;
-    }
-
-    .w-1/3 {
-        width: 100%;
-        max-height: 40vh;
-    }
-
-    .flex-1 {
-        height: 60vh;
-    }
-}
-
-/* Dark theme adjustments */
-.bg-gray-750 {
-    background-color: #2d3748;
-}
-
-/* Message styling */
-#messages > div > div {
-    word-wrap: break-word;
-    overflow-wrap: break-word;
-}
-
-/* Node selection highlight (future enhancement) */
-.node.selected circle {
-    stroke-width: 4;
-    stroke: #60a5fa;
-}
-
-/* Edge hover (future enhancement) */
-.edge:hover {
-    stroke-width: 3;
-    opacity: 1;
-}
-
-/* Markdown content styling */
-.markdown-content {
-    line-height: 1.6;
-}
-
-.markdown-content pre {
-    white-space: pre-wrap;
-    word-break: break-word;
-}
-
-.markdown-content code {
-    font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
-}
-
-.markdown-content ul,
-.markdown-content ol {
-    padding-left: 1.5rem;
-}
-
-.markdown-content li {
-    margin: 0.25rem 0;
-}
-
-.markdown-content a {
-    word-break: break-word;
-}
-
-.markdown-content blockquote {
-    margin: 0.5rem 0;
-}
-
-/* Slider styling */
-.slider {
-    -webkit-appearance: none;
-    appearance: none;
-}
-
-.slider::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background: #3b82f6;
-    cursor: pointer;
-    transition: background 0.2s ease;
-}
-
-.slider::-webkit-slider-thumb:hover {
-    background: #2563eb;
-}
-
-.slider::-moz-range-thumb {
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background: #3b82f6;
-    cursor: pointer;
-    border: none;
-    transition: background 0.2s ease;
-}
-
-.slider::-moz-range-thumb:hover {
-    background: #2563eb;
-}
-
-.slider:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
-
-.slider:disabled::-webkit-slider-thumb {
-    cursor: not-allowed;
-    background: #6b7280;
-}
-
-.slider:disabled::-moz-range-thumb {
-    cursor: not-allowed;
-    background: #6b7280;
+::-webkit-scrollbar-thumb:hover {
+    background: #777;
 }

@@ -1,484 +1,356 @@
 """
-Tree trace data structure for tracking recursive model generation.
-
-This module provides the TreeTraceNode class, which records the complete
-execution trace of a RecursiveModel's generation process as a tree structure.
-Each node represents a single generation step, including prompt, fragment,
-output, and relationships to subproblems and continuation nodes.
+Tree Trace Module
+Handles the state, hierarchy, history, and metrics of the generation tree.
 """
+from typing import List, Optional, Literal, Dict, Tuple, Callable, Any
+from .utils import format_output, AND, OR, LEAF
 
-from typing import List, TypeVar, Callable, Optional, Literal
-from .utils import format_output, AND, OR
-
+NodeStatus = Literal["WAIT_GEN", "GENERATING", "WAIT_SUB", "COMPLETED", "FINAL", "FAILED", "CANCELLED"]
 
 
 class TreeTraceNode:
     """
-    Represents a single node in the recursive generation tree.
-
-    A TreeTraceNode captures all information about a single generation step:
-    - Input: prompt and fragment
-    - Output: generated text and latency
-    - Structure: depth level, subproblems, and continuation node
-    - State: whether generation has completed
-
-    **Tree Structure:**
-    - `subproblems`: List of child nodes representing elaborations at depth+1
-    - `next`: Continuation node at the same depth after subproblems are resolved
-    - The tree follows the elaboration-continuation pattern of RecursiveModel
-
-    **Example Tree:**
-    ```
-    root (depth=0, prompt="Solve X+Y")
-    ├─ subproblem1 (depth=1, prompt="X")
-    ├─ subproblem2 (depth=1, prompt="Y")
-    └─ next (depth=0, prompt="Solve X+Y", fragment="...with X and Y solved...")
-       └─ final output
-    ```
-
-    **Attributes:**
-    - prompt (str): The problem or instruction to solve
-    - fragment (str): Previously generated text providing fragment
-    - depth (int): Recursion depth (0 = root, increases for subproblems)
-    - index (int): the position in the chain of next nodes at the same depth, starting from 0
-    - status (NodeStatus): Current node status - "WAIT_SUB" (waiting for subproblems to complete), "GENERATING" (output being generating),
-                           "COMPLETED" (all children returned), "FAILED" (generation failed), "WAIT_GEN" (waiting for generation)
-    - node_type (NodeType): Type of node - "AND" (all children must succeed), "OR" (any child can succeed),
-                            "LEAF" (output not yet generated or no branching or has no children)
-    - output (str): Raw output from base model (before format_output)
-    - latency (float): Time taken for base model generation (seconds)
-    - next (TreeTraceNode | None): Continuation node after subproblems resolved
-    - subproblems (List[TreeTraceNode]): Child nodes for elaborations
-    - final_output (str): Cached final output (lazily computed)
-    - difficulty (int): minimum number of calls needed to solve this problem
+    Class representing a single node in the tree trace of a recursive generation process.
+    Tracks generation state, output, errors, temporal history (past), and spatial children (subproblems).
     """
 
-    def __init__(self, prompt: str, fragment: str, depth: int, index:int):
-        """
-        Initialize a new TreeTraceNode.
-
-        Args:
-            prompt: The problem or instruction to solve at this node
-            fragment: Previously generated text to provide as fragment
-            depth: Current recursion depth (0 = root, increases for subproblems)
-            index: The position in the chain of next nodes at the same depth, starting from 0
-        """
-        self.prompt:str = prompt
-        self.fragment:str = fragment
-        self.depth:int = depth
-        self.index:int = index
-        self.parent:Optional["TreeTraceNode"] = None # the parent node for subproblems, not used for next nodes, thus all depth 0 nodes have parent = None
-        self.status: NodeStatus = "WAIT_GEN"  # Node starts in waiting for generation state
-        self.node_type: NodeType = "LEAF"  # Type determined after generation
-        self.output:str = ""  # Raw output from base model
-        self.latency:float = 0.0  # Generation time in seconds
-        self.next: Optional["TreeTraceNode"] = None  # Continuation node (same depth, after subproblems)
-        self.subproblems: List["TreeTraceNode"] = []  # List of child TreeTraceNode instances (depth+1)
-        self.final_output:str = ""  # Cached final output (computed by get_final_output)
-        self.last_node: "TreeTraceNode" = self  # Track the last node in the next chain for easy appending of new nodes
-        self.difficulty:int = 1 
+    def __init__(self, prompt: str, fragment: str, parent: Optional["TreeTraceNode"] = None, past: Optional[List["TreeTraceNode"]] = None, index: int = 0):
+        self.prompt: str = prompt
+        self.fragment: str = fragment
+        self.parent: Optional["TreeTraceNode"] = parent
+        self.depth: int = parent.depth + 1 if parent else 0
+        self.index: int = index
+        self.past: List["TreeTraceNode"] = past if past is not None else []
+        self.subproblems: List["TreeTraceNode"] = []
+        
+        self.status: NodeStatus = "WAIT_GEN"
+        self.type: str = LEAF  # AND, OR, or LEAF
+        self.difficulty: int = 1
+        self.is_cancelled: bool = False
+        
+        self.output: str = ""
+        self.error_message: str = ""
+        self.latency: float = 0.0
 
     def record_generation(self, output: str, latency: float):
-        """
-        Record the output and latency from a base model generation.
-
-        This method should be called once per node after the base model
-        generates output for this node's prompt and fragment.
-        Sets status to WAIT_SUB since children may need to be generated.
-
-        Args:
-            output: The raw output generated by the base model
-            latency: Time taken for generation in seconds
-        """
-        self.status = "WAIT_SUB"  # Waiting for children to be generated (if any)
-        self.latency = latency
+        """Record the successful base model output and latency."""
         self.output = output
+        self.latency = latency
 
-    def add_subproblems(self, subproblems: List[str]):
-        """
-        Add a child node representing a subproblem (elaboration).
-
-        Subproblem nodes are at depth+1 and represent elaborations
-        that were extracted from this node's output.
-
-        Args:
-            subproblem_node: TreeTraceNode instance for the subproblem
-
-        Raises:
-            ValueError: If subproblem_node is not a TreeTraceNode instance
-        """
-        for sub in subproblems:
-            new_node = TreeTraceNode(sub, "", self.depth + 1, index=0)
-            new_node.parent = self
+    def add_subproblems(self, subproblem_prompts: List[str]):
+        """Create child nodes for the current node based on extracted prompts."""
+        for i, prompt in enumerate(subproblem_prompts):
+            new_node = TreeTraceNode(prompt=prompt, fragment="", parent=self, index=i)
             self.subproblems.append(new_node)
-        self.difficulty = len(self.subproblems)
+        self.update_difficulty()
 
-    def get_final_output(self) -> str:
-        """
-        Get the final output by traversing the tree to its end.
-
-        This method follows the `next` chain to the leaf node and returns
-        its formatted output. The result is cached in `final_output`.
-
-        **Traversal Logic:**
-        1. If final_output is already cached, return it
-        2. If this node hasn't been generated, raise an error
-        3. If this is a leaf node (no next), format and return this node's output
-        4. If there's a next node, recursively get its final output
-
-        Returns:
-            The final formatted output string
-
-        Raises:
-            Exception: If called on a node that hasn't been generated yet
-
-        Example:
-            >>> root = TreeTraceNode("Solve X", "", 0)
-            >>> # ... generate and build tree ...
-            >>> final = root.get_final_output()  # Returns formatted final answer
-        """
-        # Return cached result if available
-        if self.final_output:
-            return self.final_output
-
-        # Ensure generation has completed
-        if self.status == "GENERATING":
-            raise Exception("Output not generated yet")
-
-        # Leaf node: format and cache this node's output
-        if not self.next:
-            self.final_output = format_output(self.output)
-            return self.final_output
-
-        # Non-leaf node: recursively get next node's final output
-        self.final_output = self.next.get_final_output()
-        return self.final_output
-    
-    def get_last(self) -> 'TreeTraceNode':
-        """
-        Get the last node in the next chain.
-
-        This method follows the `next` chain to the end and returns
-        the last node. This can be useful for appending new nodes to the end of the trace.
-
-        Returns:
-            The last TreeTraceNode in the next chain
-        """
-        if self.next is not None:
-            self.last_node = self.next.get_last()
-        return self.last_node
-    
     def update_difficulty(self):
         """
-        Update the difficulty of this node based on its subproblems.
-        
-        Args:
-            subproblem_difficulties: List of difficulties from subproblems
+        Recursively update the difficulty for Greedy DFS scheduling.
+        LEAF = 1, AND = sum of children, OR = min of children.
         """
-        # this is only applicable to the final node in the chain
-        if self.next:
-            self.get_last().update_difficulty()
-            return
-        if self.status == "COMPLETED":
-            self.difficulty = 0
-            return
-        if self.status == "FAILED":
-            self.difficulty = 9999999 #INF
-            return
-        if self.node_type == "LEAF":
+        if self.type == LEAF:
             self.difficulty = 1
-            return
+        else:
+            diffs = [sub.difficulty for sub in self.subproblems]
+            if not diffs:
+                self.difficulty = 1
+            elif self.type == AND:
+                self.difficulty = sum(diffs)
+            elif self.type == OR:
+                self.difficulty = min(diffs)
         
-        difficulties = []
+        # Propagate changes up to the root
+        if self.parent:
+            self.parent.update_difficulty()
+
+    def cancel_tree(self):
+        """Mark this node and all its non-final descendants as cancelled (used by OR node kill switch)."""
+        self.is_cancelled = True
+        self.status = "CANCELLED"
         for sub in self.subproblems:
-            sub_last = sub.get_last()
-            sub_last.update_difficulty()
-            difficulties.append(sub_last.difficulty)
+            if sub.status not in ["FINAL", "COMPLETED"]:
+                sub.cancel_tree()
+
+    def continue_generation(self, new_fragment: str) -> "TreeTraceNode":
+        """
+        Create a temporal continuation of this node with an updated fragment.
+        Appends the current state to the past history and replaces itself in the parent's tree.
+        """
+        # CRITICAL: Clear self.past before packing it to prevent duplicate subgraph 
+        # traversal when using the fold() utility later.
+        old_past = self.past
+        self.past = [] 
         
-        if self.node_type == "AND":
-            self.difficulty = sum(difficulties) + 1
-        elif self.node_type == "OR":
-            self.difficulty = min(difficulties)
-        return
+        new_node = TreeTraceNode(
+            prompt=self.prompt,
+            fragment=new_fragment,
+            parent=self.parent,
+            past=old_past + [self],  # The new node holds the flat history
+            index=self.index
+        )
+        
+        # Replace the old node in the parent's subproblems list
+        if self.parent and self.index < len(self.parent.subproblems):
+            self.parent.subproblems[self.index] = new_node
+            
+        return new_node
 
-T = TypeVar('T')
+    def get_final_output(self) -> str:
+        """Get the cleaned and formatted final output."""
+        if self.status == "FINAL":
+            return format_output(self.output)
+        raise ValueError(f"Output is not finalized yet. Current status: {self.status}")
 
-def fold(tree: TreeTraceNode, f: Callable[[TreeTraceNode, List[T], Optional[T]], T]) -> T:
+
+# ==========================================
+# EXTERNAL TREE UTILITY FUNCTIONS
+# ==========================================
+
+def fold(node: TreeTraceNode, func: Callable[[TreeTraceNode, List[Any], List[Any]], Any]) -> Any:
     """
-    Generic tree fold/reduce operation for TreeTraceNode.
-
-    This is a higher-order function that traverses the tree structure and applies
-    a combining function to compute a result. It provides a single abstraction
-    for all tree traversal operations.
-
-    **Traversal Pattern:**
-    1. Recursively fold all subproblems
-    2. Recursively fold the next node (if exists)
-    3. Apply the combining function f to current node and recursive results
-
-    Args:
-        tree: The TreeTraceNode to fold
-        f: A function that takes (node, subproblem_results, next_result) and
-           returns a combined result. The function should handle:
-           - node: Current TreeTraceNode
-           - subproblem_results: List of results from folding each subproblem
-           - next_result: Result from folding the next node (None if no next)
-
-    Returns:
-        The result of applying f across the entire tree structure
-
-    Example:
-        >>> # Count total nodes
-        >>> count = fold(tree, lambda node, subs, next: 1 + sum(subs) + (next or 0))
-        >>>
-        >>> # Get maximum depth
-        >>> max_d = fold(tree, lambda node, subs, next: max([0] + subs + ([next] if next else [])))
-    """
-    # Recursively fold all subproblems
-    subproblem_results: List[T] = [fold(sub, f) for sub in tree.subproblems]
-
-    # Recursively fold the next node if it exists
-    next_result: Optional[T] = fold(tree.next, f) if tree.next is not None else None
-
-    # Apply the combining function
-    return f(tree, subproblem_results, next_result)
-
-def find_next_to_generate(tree: TreeTraceNode) -> Optional[TreeTraceNode]:
-    """
-    Find the next node in the tree that is waiting for generation.
-
-    This function performs a greedy depth-first search to find the first node
-    with status "WAIT_GEN", which indicates it is waiting for generation using difficulty.
-
-    Args:
-        tree: The root TreeTraceNode to search
-    """
+    A universal tree traversal function (catamorphism) that processes both 
+    historical states (`past`) and hierarchical states (`subproblems`).
     
-    if tree.next:
-        return find_next_to_generate(tree.get_last())
+    Args:
+        node: The starting TreeTraceNode.
+        func: A callable receiving (current_node, past_results_list, subproblem_results_list)
+    """
+    past_res = [fold(p, func) for p in node.past]
+    sub_res = [fold(s, func) for s in node.subproblems]
+    return func(node, past_res, sub_res)
+
+
+def flatten_trace(node: TreeTraceNode) -> List[Tuple[str, str, str, str, str]]:
+    """Returns a list of (prompt, fragment, parent_problem, main_problem, output) for all generations."""
+    # Retrieve the main problem from the root
+    curr = node
+    while curr.parent is not None:
+        curr = curr.parent
+    main_problem = curr.prompt
+
+    def agg(n: TreeTraceNode, p_res: List[List], s_res: List[List]) -> List:
+        res = []
+        for pr in p_res: res.extend(pr)
+        
+        parent_prompt = n.parent.prompt if n.parent else "None"
+        res.append((n.prompt, n.fragment, parent_prompt, main_problem, n.output))
+        
+        for sr in s_res: res.extend(sr)
+        return res
+        
+    return fold(node, agg)
+
+
+def parallel_latency(node: TreeTraceNode) -> float:
+    """Calculates the minimum execution latency assuming infinite concurrent workers."""
+    def agg(n: TreeTraceNode, p_res: List[float], s_res: List[float]) -> float:
+        # Time spent sequentially getting to this point (past) + generation time
+        node_time = sum(p_res) + n.latency 
+        
+        # Time spent waiting on parallel children
+        if not s_res:
+            sub_time = 0.0
+        elif n.type == AND:
+            sub_time = max(s_res)  # Must wait for all AND children
+        elif n.type == OR:
+            sub_time = min(s_res)  # Only wait for the fastest OR child
+        else:
+            sub_time = 0.0
+            
+        return node_time + sub_time
+        
+    return fold(node, agg)
+
+
+def sequencial_latency(node: TreeTraceNode) -> float:
+    """Calculates the execution latency assuming only a single worker processing nodes sequentially."""
+    def agg(n: TreeTraceNode, p_res: List[float], s_res: List[float]) -> float:
+        return n.latency + sum(p_res) + sum(s_res)
+    return fold(node, agg)
+
+
+def total_calls(node: TreeTraceNode) -> int:
+    """Returns the total number of LLM API calls made across the entire tree and history."""
+    def agg(n: TreeTraceNode, p_res: List[int], s_res: List[int]) -> int:
+        call = 1 if n.output else 0
+        return call + sum(p_res) + sum(s_res)
+    return fold(node, agg)
+
+
+def max_depth(node: TreeTraceNode) -> int:
+    """Returns the maximum depth reached in the generation tree."""
+    def agg(n: TreeTraceNode, p_res: List[int], s_res: List[int]) -> int:
+        return max([n.depth] + p_res + s_res)
+    return fold(node, agg)
+
+
+def max_subproblems(node: TreeTraceNode) -> int:
+    """Returns the maximum number of simultaneous subproblems any node had."""
+    def agg(n: TreeTraceNode, p_res: List[int], s_res: List[int]) -> int:
+        return max([len(n.subproblems)] + p_res + s_res)
+    return fold(node, agg)
+
+
+def max_output_character(node: TreeTraceNode) -> int:
+    """Returns the character length of the longest base-model output in the tree."""
+    def agg(n: TreeTraceNode, p_res: List[int], s_res: List[int]) -> int:
+        return max([len(n.output)] + p_res + s_res)
+    return fold(node, agg)
+
+
+def nodes_per_level(node: TreeTraceNode) -> Dict[int, int]:
+    """Analyzes the total number of node states generated at each depth level."""
+    def agg(n: TreeTraceNode, p_res: List[Dict[int, int]], s_res: List[Dict[int, int]]) -> Dict[int, int]:
+        counts = {n.depth: 1}
+        for res_dict in p_res + s_res:
+            for depth, count in res_dict.items():
+                counts[depth] = counts.get(depth, 0) + count
+        return counts
+    return fold(node, agg)
+
+def draw_tree(
+    node: TreeTraceNode, 
+    right_spacing: float, 
+    down_spacing: float, 
+    node_radius: float
+) -> Tuple[List[Dict[str, Any]], List[Tuple[str, Tuple[float, float], Tuple[float, float]]]]:
+    """
+    Generates a 2D layout for the TreeTraceNode graph.
+    - Past nodes: Drawn sequentially to the left.
+    - Subproblems: First drawn directly below, subsequent ones to the right.
     
-    # Base Case: If this node is waiting for generation, return it
-    if tree.status == "WAIT_GEN":
-        return tree
-    elif tree.status == "FAILED":
-        return None
-    elif tree.status == "COMPLETED":
-        return None
-    elif tree.status == "GENERATING":
-        return None
+    Returns:
+        nodes: A list of JSON-serializable dictionaries with node properties and (x, y).
+        edges: A list of tuples (edge_type, (x1, y1), (x2, y2)).
+    """
+
+    def agg(
+        n: TreeTraceNode, 
+        p_res: List[Tuple], 
+        s_res: List[Tuple]
+    ) -> Tuple[List[Dict], List[Tuple], float, float, float, float]:
+        """
+        Inner aggregator function for `fold`.
+        Returns: (nodes, edges, min_x, max_x, root_x, root_y)
+        """
+        nodes = []
+        edges = []
+        
+        # 1. Base initialization for the current node (local origin at 0.0, 0.0)
+        curr_dict = {
+            "prompt": n.prompt,
+            "fragment": n.fragment,
+            "output": n.output,
+            "type": n.type,
+            "status": n.status,
+            "difficulty": n.difficulty,
+            "x": 0.0,
+            "y": 0.0
+        }
+        nodes.append(curr_dict)
+        
+        # Bounding box of the current node alone
+        min_x = -node_radius
+        max_x = node_radius
+        
+        # 2. Process Subproblems (Spatial hierarchy downwards and rightwards)
+        if s_res:
+            # Place the first subproblem directly below the current node
+            first_s_nodes, first_s_edges, s_min, s_max, s_rx, s_ry = s_res[0]
+            
+            # Shift amounts for the first subproblem
+            dx = 0.0 - s_rx
+            dy = down_spacing - s_ry
+            
+            # Apply shifts
+            for nd in first_s_nodes:
+                nd["x"] += dx
+                nd["y"] += dy
+            for i in range(len(first_s_edges)):
+                etype, p1, p2 = first_s_edges[i]
+                first_s_edges[i] = (etype, (p1[0]+dx, p1[1]+dy), (p2[0]+dx, p2[1]+dy))
+                
+            nodes.extend(first_s_nodes)
+            edges.extend(first_s_edges)
+            edges.append((n.type, (0.0, 0.0), (0.0, down_spacing))) # Edge from parent to first sub
+            
+            # Update parent bounding box
+            min_x = min(min_x, s_min + dx)
+            max_x = max(max_x, s_max + dx)
+            prev_max_x = s_max + dx
+            
+            # Place remaining subproblems sequentially to the right
+            for i in range(1, len(s_res)):
+                s_nodes, s_edges, s_min_i, s_max_i, s_rx_i, s_ry_i = s_res[i]
+                
+                # Align the left edge of this subproblem to the right edge of the previous one
+                dx_i = prev_max_x + right_spacing - s_min_i
+                dy_i = down_spacing - s_ry_i
+                
+                # Apply shifts
+                for nd in s_nodes:
+                    nd["x"] += dx_i
+                    nd["y"] += dy_i
+                for j in range(len(s_edges)):
+                    etype, p1, p2 = s_edges[j]
+                    s_edges[j] = (etype, (p1[0]+dx_i, p1[1]+dy_i), (p2[0]+dx_i, p2[1]+dy_i))
+                    
+                nodes.extend(s_nodes)
+                edges.extend(s_edges)
+                
+                # Edge from parent to this subproblem's root
+                edges.append((n.type, (0.0, 0.0), (s_rx_i + dx_i, down_spacing)))
+                
+                # Update parent bounding box
+                min_x = min(min_x, s_min_i + dx_i)
+                max_x = max(max_x, s_max_i + dx_i)
+                prev_max_x = s_max_i + dx_i
+
+        # 3. Process Past nodes (Temporal history extending to the left)
+        if p_res:
+            # Start placing to the left of the current bounding box
+            target_right = min_x - right_spacing
+            
+            # The coordinate we are pointing TO (initially the current node)
+            next_rx, next_ry = 0.0, 0.0  
+            
+            # Iterate backwards (from most recent past to oldest past)
+            for i in range(len(p_res)-1, -1, -1):
+                p_nodes, p_edges, p_min, p_max, p_rx, p_ry = p_res[i]
+                
+                # Align the right edge of this past node to our target left edge
+                dx_p = target_right - p_max
+                dy_p = 0.0 - p_ry
+                
+                # Apply shifts
+                for nd in p_nodes:
+                    nd["x"] += dx_p
+                    nd["y"] += dy_p
+                for j in range(len(p_edges)):
+                    etype, p1, p2 = p_edges[j]
+                    p_edges[j] = (etype, (p1[0]+dx_p, p1[1]+dy_p), (p2[0]+dx_p, p2[1]+dy_p))
+                    
+                nodes.extend(p_nodes)
+                edges.extend(p_edges)
+                
+                curr_rx_shifted = p_rx + dx_p
+                curr_ry_shifted = p_ry + dy_p
+                
+                # Arrow pointing from this past node to the chronological next node
+                edges.append(("PAST", (curr_rx_shifted, curr_ry_shifted), (next_rx, next_ry)))
+                
+                # Expand bounding box
+                min_x = min(min_x, p_min + dx_p)
+                max_x = max(max_x, p_max + dx_p)
+                
+                # Update targets for the previous chronological node
+                target_right = p_min + dx_p - right_spacing
+                next_rx, next_ry = curr_rx_shifted, curr_ry_shifted
+
+        return nodes, edges, min_x, max_x, 0.0, 0.0
+
+    # Execute the bottom-up fold
+    final_nodes, final_edges, _, _, _, _ = fold(node, agg)
     
-    else: # this node is waiting for subproblems to complete
-        # generate the subproblem with minimal difficulty that is in any WAITING states
-        for sub in sorted(tree.subproblems, key=lambda x: x.difficulty):
-            if sub.status in ["WAIT_GEN", "WAIT_SUB"]:
-                return find_next_to_generate(sub)
-        return None
-
-
-def flatten_trace(tree: TreeTraceNode) -> List[TreeTraceNode]:
-    """
-    Flatten the tree trace into a list in DFS manner where subproblems are explored first.
-
-    This function traverses the tree in depth-first order, exploring all subproblems
-    before adding the current node, then continuing with the next node.
-
-    **Traversal Order:**
-    1. Recursively flatten all subproblems (depth-first)
-    2. Add the current node
-    3. Recursively flatten the next node if it exists
-
-    Args:
-        tree: The root TreeTraceNode to flatten
-
-    Returns:
-        A list of TreeTraceNode instances in DFS order
-
-    Example:
-        >>> root = TreeTraceNode("Solve X+Y", "", 0)
-        >>> # ... build tree ...
-        >>> nodes = flatten_trace(root)
-        >>> # Returns: [subproblem1_nodes..., subproblem2_nodes..., root, next_nodes...]
-    """
-    result: List[TreeTraceNode] = []
-
-    # First, recursively flatten all subproblems (DFS)
-    for subproblem in tree.subproblems:
-        result.extend(flatten_trace(subproblem))
-
-    # Add the current node
-    result.append(tree)
-
-    # Finally, recursively flatten the next node if it exists
-    if tree.next is not None:
-        result.extend(flatten_trace(tree.next))
-
-    return result
-
-def parallel_latency(tree: TreeTraceNode) -> float:
-    """
-    Calculate the total latency of the tree trace assuming parallel execution of subproblems.
-
-    This function computes the total time taken for the entire generation process
-    by considering that all subproblems at the same depth are executed in parallel.
-    The latency is calculated as follows:
-    1. For leaf nodes (no subproblems), return their latency.
-    2. For non-leaf nodes, return the maximum latency among its subproblems plus its own latency.
-    3. If a node has a next node, add its latency to the total.
-
-    Args:
-        tree: The root TreeTraceNode to calculate latency for
-
-    Returns:
-        The total latency assuming parallel execution of subproblems
-    """
-    subproblem_latencies = [parallel_latency(sub) for sub in tree.subproblems]
-    if tree.node_type == "AND":
-        max_subproblem_latency = max(subproblem_latencies, default=0)
-    elif tree.node_type == "OR":
-        max_subproblem_latency = min(subproblem_latencies, default=0)
-    else:  # LEAF
-        max_subproblem_latency = tree.latency
-    total_latency = tree.latency + max_subproblem_latency
-
-    if tree.next is not None:
-        total_latency += parallel_latency(tree.next)
-
-    return total_latency
-
-def sequencial_latency(tree: TreeTraceNode) -> float:
-    """
-    Calculate the total latency of the tree trace assuming sequential execution of all nodes.
-
-    This function computes the total time taken for the entire generation process
-    by summing the latencies of all nodes in a depth-first manner, including subproblems and next nodes.
-
-    Args:
-        tree: The root TreeTraceNode to calculate latency for
-
-    Returns:
-        The total latency assuming sequential execution of all nodes
-    """
-    return fold(
-        tree,
-        lambda node, subs, next_result:
-            node.latency + sum(subs) + (next_result if next_result is not None else 0)
-    )
-
-def total_calls(tree: TreeTraceNode) -> int:
-    """
-    Count the total number of generation calls in the tree trace.
-
-    This function counts the total number of nodes in the tree, which corresponds
-    to the total number of generation calls made during the recursive process.
-
-    Args:
-        tree: The root TreeTraceNode to count calls for
-
-    Returns:
-        The total number of generation calls (nodes) in the tree
-    """
-    return fold(
-        tree,
-        lambda _, subs, next_result:
-            1 + sum(subs) + (next_result if next_result is not None else 0)
-    )
-
-def max_depth(tree: TreeTraceNode) -> int:
-    """
-    Calculate the maximum depth of the tree trace.
-
-    This function computes the maximum depth of the tree, which corresponds
-    to the deepest level of recursion reached during the generation process.
-
-    Args:
-        tree: The root TreeTraceNode to calculate depth for
-
-    Returns:
-        The maximum depth of the tree
-    """
-    return len(nodes_per_level(tree)) - 1
-
-def max_subproblem(tree: TreeTraceNode) -> int:
-    """
-    Calculate the maximum number of subproblems at any level in the tree trace.
-
-    This function computes the maximum number of subproblems (children) that any node in the tree has,
-    which corresponds to the maximum branching factor of the recursive generation process.
-
-    Args:
-        tree: The root TreeTraceNode to calculate max subproblems for
-
-    Returns:
-        The maximum number of subproblems at any level in the tree
-    """
-    return fold(
-        tree,
-        lambda node, subs, next_result:
-            max([len(node.subproblems)] + subs + ([next_result] if next_result is not None else []))
-    )
-
-def max_output_character(tree: TreeTraceNode) -> int:
-    """
-    Find the maximum number of characters in any output across the tree trace.
-
-    This function traverses all nodes and returns the length of the longest
-    output string found in any node.
-
-    Args:
-        tree: The root TreeTraceNode to analyze
-
-    Returns:
-        The maximum number of characters in any node's output
-    """
-    return fold(
-        tree,
-        lambda node, subs, next_result:
-            max([len(node.output)] + subs + ([next_result] if next_result is not None else []))
-    )
-
-
-def nodes_per_level(tree: TreeTraceNode) -> List[int]:
-    """
-    Analyze the number of nodes at each level of the tree trace.
-
-    This function counts how many nodes exist at each depth level in the tree,
-    providing insight into the tree's structure and branching behavior.
-
-    Args:
-        tree: The root TreeTraceNode to analyze
-
-    Returns:
-        A list of integers where index i contains the count of nodes at depth i
-
-    Example:
-        >>> root = TreeTraceNode("Solve X+Y", "", 0)
-        >>> # ... build tree with nodes at depth 0, 1, 2 ...
-        >>> counts = nodes_per_level(root)
-        >>> # Returns: [3, 5, 2] meaning 3 nodes at depth 0, 5 at depth 1, 2 at depth 2
-    """
-    def combine(node, subs, next_result):
-        # Start with current node's depth
-        result = {node.depth: 1}
-
-        # Merge all subproblem counts
-        for sub_dict in subs:
-            for depth, count in sub_dict.items():
-                result[depth] = result.get(depth, 0) + count
-
-        # Merge next node's counts
-        if next_result is not None:
-            for depth, count in next_result.items():
-                result[depth] = result.get(depth, 0) + count
-
-        return result
-
-    counts = fold(tree, combine)
-
-    # Convert the dictionary to a list
-    if not counts:
-        return []
-
-    max_depth_level = max(counts.keys())
-    result = [counts.get(i, 0) for i in range(max_depth_level + 1)]
-
-    return result
+    return final_nodes, final_edges

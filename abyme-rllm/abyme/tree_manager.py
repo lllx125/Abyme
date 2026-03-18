@@ -1,0 +1,212 @@
+"""
+Tree Manager Module for Agent 4.0 Architecture
+Handles thread-safe execution, Greedy DFS task selection, state resolution, and failure injection.
+"""
+import threading
+from typing import Optional
+
+# Assuming these are imported from your project structure
+from .utils import AND, OR, LEAF, THINK, extract_delegations, replace_delegations_with_responses
+from .tree_trace import TreeTraceNode
+
+class TreeManager:
+    """
+    Thread-safe orchestrator for the RecursiveModel generation tree.
+    """
+    
+    def __init__(self, root: TreeTraceNode, proceed_when_fail: bool = True):
+        self.root: TreeTraceNode = root
+        self.proceed_when_fail: bool = proceed_when_fail
+        
+        # Concurrency Primitives
+        self.lock = threading.RLock()
+        self.worker_condition = threading.Condition(self.lock)
+        
+        # Execution State
+        self.is_finished: bool = False
+
+    def get_next_task(self) -> Optional[TreeTraceNode]:
+        """
+        Thread-Safe Greedy DFS Traversal.
+        Returns the next optimal node in 'WAIT_GEN' state.
+        """
+        with self.lock:
+            task = self._dfs_find_best(self.root)
+            if task:
+                task.status = "GENERATING"
+            return task
+
+    def _dfs_find_best(self, node: TreeTraceNode) -> Optional[TreeTraceNode]:
+        """Recursive helper for Greedy DFS."""
+        if node.is_cancelled or node.status in ["COMPLETED", "FINAL", "FAILED"]:
+            return None
+            
+        if node.status == "WAIT_GEN":
+            return node
+            
+        if node.status == "WAIT_SUB":
+            # Filter valid children
+            valid_children = [
+                c for c in node.subproblems 
+                if not c.is_cancelled and c.status not in ["COMPLETED", "FINAL", "FAILED"]
+            ]
+            
+            if not valid_children:
+                return None
+                
+            # Greedy Selection: Evaluate the easiest path first
+            valid_children.sort(key=lambda c: c.difficulty)
+            
+            for child in valid_children:
+                best_leaf = self._dfs_find_best(child)
+                if best_leaf:
+                    return best_leaf
+                    
+        return None
+
+    def report_success(self, node: TreeTraceNode, output: str):
+        """
+        Called by a worker thread when the base model successfully generates an output.
+        """
+        with self.lock:
+            if node.is_cancelled:
+                return
+
+            node.output = output
+
+            # Base Case
+            if f"</{THINK}>" in output:
+                node.type = LEAF
+                node.status = "FINAL"
+                self._resolve_parent(node)
+
+            # OR Node
+            elif f"<{OR}>" in output:
+                node.type = OR
+                node.status = "WAIT_SUB"
+                sub_prompts = extract_delegations(output, tag=OR)
+                node.add_subproblems(sub_prompts)
+                
+            # AND Node
+            elif f"<{AND}>" in output:
+                node.type = AND
+                node.status = "WAIT_SUB"
+                sub_prompts = extract_delegations(output, tag=AND)
+                node.add_subproblems(sub_prompts)
+                
+            # Linear Continuation
+            else:
+                node.type = LEAF
+                node.status = "COMPLETED"
+                new_node = node.continue_generation(node.fragment + "\n" + output)
+                if node == self.root:
+                    self.root = new_node
+                    
+            self.worker_condition.notify_all()
+
+    def report_failure(self, node: TreeTraceNode, error: str):
+        """
+        Called by a worker thread when the generation fails.
+        """
+        with self.lock:
+            if node.is_cancelled:
+                return
+                
+            node.status = "FAILED"
+            node.error_message = error
+            self._resolve_parent(node)
+            self.worker_condition.notify_all()
+
+    def wait_for_completion(self):
+        """
+        Blocks the main application thread until the tree successfully completes or fails.
+        """
+        with self.lock:
+            while not self.is_finished:
+                self.worker_condition.wait()
+
+    def _resolve_parent(self, child_node: TreeTraceNode):
+        parent = child_node.parent
+        if parent is None:
+            self.is_finished = True
+            return
+
+        # ----------------------------------------------------
+        # SCENARIO A: A Child Succeeded (FINAL)
+        # ----------------------------------------------------
+        if child_node.status == "FINAL":
+            if parent.type == AND:
+                if all(sub.status == "FINAL" for sub in parent.subproblems):
+                    parent.status = "COMPLETED"
+                    # Inject ONLY the string after </think>
+                    responses = [sub.get_final_output() for sub in parent.subproblems]
+                    reconstructed = replace_delegations_with_responses(parent.output, responses, tag=AND)
+                    
+                    new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
+                    if parent == self.root: self.root = new_node
+                    self.worker_condition.notify_all()
+                    
+            elif parent.type == OR:
+                parent.status = "COMPLETED"
+                for sub in parent.subproblems:
+                    if sub != child_node and sub.status not in ["FINAL", "COMPLETED"]:
+                        sub.cancel_tree()
+                
+                responses = []
+                for sub in parent.subproblems:
+                    if sub.status == "FINAL":
+                        responses.append(sub.get_final_output())
+                    elif sub.status == "FAILED":
+                        # FIX: Remove sub.fragment to prevent context explosion
+                        responses.append(f"FAILED\n{sub.output}")
+                    elif sub.is_cancelled:
+                        responses.append("CANCELLED")
+                        
+                reconstructed = replace_delegations_with_responses(parent.output, responses, tag=OR)
+                new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
+                if parent == self.root: self.root = new_node
+                self.worker_condition.notify_all()
+
+        # ----------------------------------------------------
+        # SCENARIO B: A Child Failed (FAILED)
+        # ----------------------------------------------------
+        elif child_node.status == "FAILED":
+            if parent.type == AND:
+                for sub in parent.subproblems:
+                    if sub != child_node and sub.status not in ["FINAL", "COMPLETED"]:
+                        sub.cancel_tree()
+
+                if self.proceed_when_fail:
+                    parent.status = "COMPLETED"
+                    responses = []
+                    for sub in parent.subproblems:
+                        if sub.status == "FINAL":
+                            responses.append(sub.get_final_output())
+                        elif sub.status == "FAILED":
+                            # FIX: Inject only output
+                            responses.append(f"FAILED\n{sub.output}")
+                        else:
+                            responses.append("CANCELLED")
+                            
+                    reconstructed = replace_delegations_with_responses(parent.output, responses, tag=AND)
+                    new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
+                    if parent == self.root: self.root = new_node
+                else:
+                    parent.status = "FAILED"
+                    parent.error_message = f"Subproblem {child_node.index} failed: {child_node.error_message}"
+                    self._resolve_parent(parent)
+                    
+            elif parent.type == OR:
+                if all(sub.status == "FAILED" for sub in parent.subproblems):
+                    if self.proceed_when_fail:
+                        parent.status = "COMPLETED"
+                        # FIX: Inject only output for all failed attempts
+                        responses = [f"FAILED\n{sub.output}" for sub in parent.subproblems]
+                        reconstructed = replace_delegations_with_responses(parent.output, responses, tag=OR)
+                        
+                        new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
+                        if parent == self.root: self.root = new_node
+                    else:
+                        parent.status = "FAILED"
+                        parent.error_message = "All attempted approaches failed."
+                        self._resolve_parent(parent)

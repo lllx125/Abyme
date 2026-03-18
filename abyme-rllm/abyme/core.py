@@ -1,12 +1,17 @@
 """
 Recursive engine for processing elaborate/response cycles using RecursiveModel pattern.
 """
-from typing import List,  Optional, Callable, TYPE_CHECKING
-from .model import Model, DeepSeekModel, GPTModel, ErrorGuardModel
-from .magic import magic_prompt, magic_formatter, magic_guard_prompt
-from .utils import *
-from .tree_trace import TreeTraceNode
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Callable, TYPE_CHECKING
+
+# Assuming these are imported from your project structure
+from .utils import default_formatter, verify_format
+from .tree_trace import TreeTraceNode
+from .tree_manager import TreeManager
+from .model import Model, DeepSeekModel, GPTModel, ErrorGuardModel
+from .magic import *
 
 # Lazy imports - only load torch/transformers when needed for HuggingFace models
 # This allows lightweight usage with DeepSeek/GPT without installing heavy dependencies
@@ -16,38 +21,11 @@ if TYPE_CHECKING:
 
 class RecursiveModel(Model):
     """
-    A recursive model wrapper that implements delegation-based problem decomposition.
-
-    This model wraps a base Model and enables recursive generation by:
-    1. Detecting <delegate>...</delegate> tags in model output
-    2. Recursively solving each delegation as a sub-problem
-    3. Replacing delegations with their solutions and continuing generation
-
-    The recursive process allows the model to:
-    - Break complex problems into simpler sub-problems
-    - Solve sub-problems independently with full fragment
-    - Integrate sub-solutions back into the main reasoning flow
-    - Continue generation with enhanced fragment from solved sub-problems
-    - Process sub-problems in parallel (when max_parallel_workers > 1)
-
-    **Safety Constraints:**
-    - max_depth: Prevents infinite recursion by limiting nesting levels
-    - max_call: Prevents resource exhaustion by capping total model calls
-    - max_parallel_workers: Controls concurrent execution of sub-problems
-
-    **Trace Recording:**
-    - Uses TreeTraceNode to record the entire generation tree
-    - Access via last_generation_trace() for debugging and analysis
-    - Tracks: prompts, fragments, depths, outputs, latencies, and subproblem relationships
-
-    **Error Handling and Partial Traces:**
-    - All errors propagate to the root and are re-raised
-    - Partial successful traces are preserved in self.trace even on failure
-    - Failed nodes are never connected to the tree structure
-    - Successful subproblems are preserved even when later siblings fail
-    - No continuation (next) is created if any subproblem fails
-    - This allows inspection of what succeeded before failure occurred
-
+    A multi-threaded, recursive model wrapper that implements delegation-based problem decomposition.
+    
+    This class manages a pool of worker threads that continuously poll a thread-safe
+    TreeManager for the next optimal subproblem (using Greedy DFS). It enforces global
+    safety constraints such as max_call limits and max_depth boundaries.
     """
 
     def __init__(self,
@@ -55,283 +33,171 @@ class RecursiveModel(Model):
                  guard_model: Optional[Model] = None,
                  max_depth: int = 20,
                  max_call: int = 50,
-                 max_chain_length: int = 5,
-                 max_parallel_workers: int = 1,
+                 max_parallel_workers: int = 4,
                  max_subproblem_retry: int = 2,
+                 max_chain_length: int = 5,
+                 proceed_when_fail: bool = True,
                  formatter: Callable[[str, str, str, str], str] = default_formatter,
-                 print_progress: bool = False
-                 ):
+                 print_progress: bool = False):
         """
-        Initialize the recursive model wrapper.
+        Initialize the multi-threaded recursive model.
 
         Args:
             base_model: The underlying Model to use for generation.
-            guard_model: The non-recursive Model to use when max recursion depth is reached.
-            max_depth: Maximum recursion depth allowed. Prevents infinite recursion.
-                      Each delegation increases depth by 1.
-            max_call: Maximum total number of model calls allowed across all recursion levels.
-                     Prevents resource exhaustion from too many API calls.
-            max_chain_length: Maximum length of the continuation chain (next nodes) at each depth level.
-            max_parallel_workers: Maximum number of parallel workers for recursive generation.
-            max_subproblem_retry: Maximum number of retry attempts for each subproblem generation.
-                                 Defaults to 1 (no retry).
-            formatter: Function to format prompt and fragment into a single string for the base model.
-            print_progress: Whether to print the generation to the console
+            guard_model: Model to use when max recursion depth is reached (forces a leaf response).
+            max_depth: Maximum recursion depth allowed. Prevents infinite nested delegations.
+            max_call: Maximum total number of model calls allowed across the entire tree.
+            max_parallel_workers: Number of threads to spawn for parallel subproblem execution.
+            max_subproblem_retry: Retry limit for individual network/parsing failures.
+            formatter: Function to format prompt context for the LLM.
+            print_progress: If True, prints thread-safe debug logs to the console.
         """
         self.base_model = base_model
         self.guard_model = guard_model
         self.max_depth = max_depth
         self.max_call = max_call
-        self.max_chain_length = max_chain_length
         self.max_parallel_workers = max_parallel_workers
         self.max_subproblem_retry = max_subproblem_retry
-        self.call_count = 0  # Tracks total calls across all recursion levels
         self.formatter = formatter
         self.print_progress = print_progress
-        self.trace = TreeTraceNode("","",0,0)  # Store the trace of the last generation for debugging
-        self.main_problem = ""  # Store the main problem prompt for context in subproblems
-
+        self.trace: TreeTraceNode = TreeTraceNode(prompt="", fragment="")  # Placeholder root node for the trace
+        # Thread-safe global call tracking
+        self.call_count = 0
+        self.call_lock = threading.Lock()
+        self.print_lock = threading.Lock()
+        self.max_chain_length = max_chain_length
+        self.proceed_when_fail = proceed_when_fail
 
     def generate(self, prompt: str, max_attempt: int = 1) -> str:
         """
-        Generate a response with automatic retry mechanism on failures.
-
-        This is the main entry point for generating responses. It:
-        1. Resets the call counter for a fresh generation session
-        2. Attempts generation up to max_attempt times
-        3. Retries on exceptions (e.g., max_depth or max_call exceeded)
-        4. Returns the final successful result
-
-        **Retry Behavior:**
-        - Each retry gets a fresh attempt with reset call_count
-        - Exceptions are caught and logged, then generation retries
-        - The final attempt (after all retries fail) is not caught
-
-        Args:
-            prompt: The problem or instruction to solve
-            max_attempt: Maximum number of retry attempts if generation fails
-
-        Returns:
-            The final generated response string with all delegations resolved
-
-        Raises:
-            Exception: If the final attempt fails (after all retries exhausted)
-
-        Example:
-            >>> model = RecursiveModel(base_model, max_depth=2, max_call=5)
-            >>> result = model.generate("Solve problem X", max_attempt=3)
-            # If first 2 attempts hit max_call, 3rd attempt will retry
+        Main entry point. Initializes the tree, starts the thread pool, and waits for completion.
         """
-        self.main_problem = prompt
-        # Try up to max_attempt times, catching exceptions
-        last_error = None
-        for _ in range(max_attempt):
-            try:
-                self.call_count = 0
-                self.trace = TreeTraceNode(prompt=prompt, fragment="", depth=0, index=0)
-                self._recursive_generate(self.trace)
-                return self.trace.get_final_output()  # Success, return immediately
-            except Exception as e:
-                last_error = e
+        # Reset execution state for a fresh run
+        with self.call_lock:
+            self.call_count = 0
+
+        self.trace = TreeTraceNode(prompt=prompt, fragment="", index=0)
+        manager = TreeManager(self.trace)
+
+        # Spawn the thread pool
+        with ThreadPoolExecutor(max_workers=self.max_parallel_workers) as executor:
+            # Submit N worker loops to the pool
+            futures = []
+            for _ in range(self.max_parallel_workers):
+                future = executor.submit(self._worker_loop, manager, self.max_subproblem_retry, prompt)
+                futures.append(future)
+
+            # Block the main thread until the tree resolves to FINAL or FAILED
+            manager.wait_for_completion()
+            
+            # Wake up any workers currently sleeping so they can exit gracefully
+            with manager.lock:
+                manager.worker_condition.notify_all()
+
+        # Update self.trace to point to the resolved root (in case manager replaced it during continuation)
+        self.trace = manager.root
+
+        # Evaluate the final state
+        if self.trace.status == "FINAL":
+            return self.trace.get_final_output()
+        else:
+            raise Exception(f"Tree generation failed. Reason: {self.trace.error_message}")
+
+    def _worker_loop(self, manager: TreeManager, max_attempt: int, main_problem: str):
+        """
+        The continuous execution loop run by each thread.
+        Asks the TreeManager for tasks, executes LLM calls, and reports back.
+        """
+        while True:
+            # Check if the overall generation has finished (successful or failed)
+            with manager.lock:
+                if manager.is_finished:
+                    break
+
+            # Ask TreeManager for the next best node based on Greedy DFS
+            task = manager.get_next_task()
+
+            # If no tasks are currently ready, wait cooperatively until notified
+            if task is None:
+                with manager.lock:
+                    if manager.is_finished:
+                        break
+                    # Wait for up to 0.5s or until another thread wakes us up with notify_all()
+                    manager.worker_condition.wait(timeout=0.5)
                 continue
 
-        raise Exception(f"All {max_attempt} attempts failed. Final attempt error: {last_error}")
+            # Cooperative Cancellation Check: Skip if an OR-sibling already won
+            if task.is_cancelled:
+                continue
 
-    def _recursive_generate(self, node: TreeTraceNode):
+            # Execute the API call inside a broad try/catch to ensure we report back
+            try:
+                output = self._guarded_generate_with_formatter(task, max_attempt, main_problem)
+                manager.report_success(task, output)
+            except Exception as e:
+                manager.report_failure(task, str(e))
+
+    def _guarded_generate_with_formatter(self, node: TreeTraceNode, max_attempt: int, main_problem: str) -> str:
         """
-        Recursively generate output by solving delegations as sub-problems.
-
-        This implements the core recursive delegation algorithm using TreeTraceNode
-        for tracking the entire generation tree.
-
-        **Generation Process:**
-        1. **Safety Checks**: Verify depth and call limits not exceeded
-        2. **Generate**: Call base model with node's prompt and fragment
-        3. **Extract delegations**: Check for <delegate>...</delegate> tags
-        4. **Base Case**: If no delegations, set node.final_output and return
-        5. **Recursive Case**:
-           a. Recursively solve each delegation as independent sub-problem
-           b. Create child TreeTraceNode for each subproblem
-           c. Replace delegation tags with <response>sub_solution</response>
-           d. Create continuation node with updated fragment (depth unchanged)
-           e. Link continuation node as node.next
-
-        **Key Design Decisions:**
-        - Sub-problems are solved with empty fragment (independent reasoning)
-        - Sub-problems increase depth by 1 (prevent infinite nesting)
-        - Continuation call keeps same depth (not a new sub-problem)
-        - Call count is global across all recursion levels
-        - TreeTraceNode structure allows inspection of entire generation tree
-
-        Args:
-            node: TreeTraceNode containing:
-                  - prompt: The current problem to solve
-                  - fragment: Previously generated text
-                  - depth: Current recursion depth (0 = top level)
-
-        Returns:
-            TreeTraceNode: The input node, now populated with generation data,
-                          subproblems, and continuation nodes
-
-        Raises:
-            Exception: If maximum recursion depth is exceeded (depth > max_depth)
-            Exception: If maximum call count is exceeded (call_count >= max_call)
-
-        Example:
-            >>> # Internal recursive flow
-            >>> root = TreeTraceNode("Solve X+Y", "", 0)
-            >>> _recursive_generate(root)
-            # Generates: "I need <delegate>X</delegate> and <delegate>Y</delegate>"
-            # Creates child nodes for "X" and "Y" at depth 1
-            # Replaces: "I need <response>5</response> and <response>3</response>"
-            # Creates continuation node at depth 0
-            # Final output via root.get_final_output(): "So X+Y = 8"
+        Handles formatting, API retries, format validation, and global limits.
+        Raises exceptions on failure, which are caught by the _worker_loop.
         """
-        
-        # Base Case:
-        if node.depth > self.max_depth:
-            if not self.guard_model:
-                node.status = "FAILED"
-                raise Exception("Maximum recursion depth reached.")
+        # 1. Enforce Global Call Limits (Thread-Safe)
+        with self.call_lock:
+            if self.call_count >= self.max_call:
+                raise Exception(f"Maximum global call count ({self.max_call}) exceeded.")
+            self.call_count += 1
+
+        # 2. Enforce Depth Limits
+        active_model = self.base_model
+        if node.depth >= self.max_depth or len(node.past) >= self.max_chain_length:
+            if self.guard_model:
+                active_model = self.guard_model
             else:
-                try:
-                    output = self._guarded_generate_with_formatter(node, model=self.guard_model, max_attempt=1)
-                except Exception as e:
-                    node.status = "FAILED"
-                    raise Exception(f"Error in base model generation: {e}")
-
-                node.final_output = format_output(output)
-                node.status = "COMPLETED"
-                if node.parent:
-                    self._continue_generation(node.parent)
-                return node
-        
-        if self.call_count >= self.max_call:
-            node.status = "FAILED"
-            raise Exception("Maximum call count exceeded.")
-        
-        if node.index > self.max_chain_length:
-            node.status = "FAILED"
-            raise Exception(f"Maximum chain length exceeded at depth {node.depth}.")
-
-        # Generate output using base model (retries up to 3 times internally)
-        try:
-            output = self._guarded_generate_with_formatter(node,model=self.base_model, max_attempt=1)
-        except Exception as e:
-            node.status = "FAILED"
-            raise Exception(f"Error in base model generation: {e}")
+                raise Exception(f"Maximum recursion depth ({self.max_depth}) reached.")
 
 
-        # Base case: answer is generated
-        if "</{THINK}>" in output:
-            node.final_output = format_output(output)
-            node.status = "COMPLETED"
-            if node.parent:
-                self._continue_generation(node.parent)
-            return
-        
-        # AND OR delegation case: extract delegations and solve as subproblems
-        if "<{AND}>" in output:
-            type = AND
-            node.node_type = "AND"
-            subproblems = extract_delegations(output, tag=AND)
-        elif "<{OR}>" in output: 
-            type = OR
-            node.node_type = "OR"
-            subproblems = extract_delegations(output, tag=OR) 
-        
-        node.add_subproblems(subproblems)
+        # 3. Format the Prompt Context
+        boss_problem = node.parent.prompt if node.parent else "None"
+        formatted_prompt = self.formatter(
+            node.prompt,
+            main_problem,
+            boss_problem,
+            node.fragment
+        )
 
-        # TODO: trigger worker to start working
-
-    
-    def _guarded_generate_with_formatter(self, node: TreeTraceNode, model: Model, max_attempt: int) -> str:
-        """
-        Helper method to call base model's generate_with_formatter with retries.
-
-        This method wraps the base model's generate_with_formatter in a retry loop:
-        - Tries up to max_attempt times
-        - Catches exceptions and retries
-        - If all attempts fail, raises the last exception
-
-        Args:
-            node: The TreeTraceNode instance containing prompt, fragment, and depth
-            max_attempt: Maximum number of retry attempts if generation fails
-
-        Returns:
-            The generated response string from the base model strictly formatted
-
-        Raises:
-            Exception: If all attempts fail, raises the last encountered exception
-        """
-
-        self.call_count += 1
-            
         last_error = None
-        for _ in range(max_attempt):
+
+        # 4. Retry Loop for the actual API generation
+        for attempt in range(max_attempt):
             try:
                 start_time = time.time()
-                context = node.parent.prompt if node.parent else "None"
-                node.status = "GENERATING"
-                response = model.generate(self.formatter(node.prompt, self.main_problem, context, node.fragment), max_attempt=1)
+                
+                # Make the blocking network call
+                response = active_model.generate(formatted_prompt, max_attempt=1)
+                latency = time.time() - start_time
+
+                # Validate the XML-like tags using your utility
                 if not verify_format(response):
-                    raise Exception(f"Invalid format detected in response. output:{ response }")
-                node.record_generation(response, latency=time.time()-start_time)
+                    raise ValueError(f"Invalid format detected in response. Output: {response}")
+
+                # Save metrics to the node directly
+                node.record_generation(response, latency)
+
+                # Thread-safe console logging
                 if self.print_progress:
-                    print(f"{'{'}\n\"prompt\":\"{node.prompt}\"\n\"context\":\"{context}\"\n\"fragment\":\"{node.fragment}\"\n\"output\":\"{response}\"\n{'}'}\ndepth: {node.depth}\nlatency: {node.latency}\ncall: {self.call_count}\n{'='*50}")
+                    with self.print_lock:
+                        print(f"{'{'}\n\"prompt\":\"{node.prompt}\"\n\"context\":\"{boss_problem}\"\n\"fragment\":\"{node.fragment}\"\n\"output\":\"{response}\"\n{'}'}\ndepth: {node.depth}\nlatency: {latency:.2f}s\ncall: {self.call_count}\n{'='*50}")
+
                 return response
+
             except Exception as e:
                 last_error = e
+                # Only retry if we haven't exhausted attempts
                 continue
-        raise Exception(f"All {max_attempt} attempts failed for base model. Last error: {last_error}")
 
-    def _continue_generation(self, node: TreeTraceNode):
-        """
-        Helper method to continue generation after sub-problems are solved.
-
-        This method is called when a sub-problem is completed and we need to
-        continue generating the main problem with the updated fragment that
-        includes the resolved sub-problem.
-
-        Args:
-            node: The TreeTraceNode instance representing the main problem that needs to continue generation
-
-        Returns:
-            None (the node's next will be updated with the continuation)
-
-        Raises:
-            Exception: If generation fails during continuation
-        """
-        # Check whether the node is completed
-        responses = []
-        type = AND if node.node_type == "AND" else OR
-        for sub in node.subproblems:
-            sub_last = sub.get_last()
-            # for AND node, we need to wait for all subproblems to complete
-            if sub_last.status != "COMPLETED" and type == AND:
-                return
-            # for OR node, if this guarenteed because this function is triggered only when a subproblem completes
-            
-            if sub_last.status == "COMPLETED":
-                responses.append(sub_last.final_output)
-            else:
-                # append the partial response from this child
-                responses.append("INCOMPLETE\n\nCurrent Progress:"+sub_last.fragment + sub_last.output)
-            
-        # Replace all tags with <response>...</response>
-        reconstructed_output = replace_delegations_with_responses(node.output, responses, type)
-
-        # Continue generation with updated fragment
-        # - Same prompt (still solving the original problem)
-        # - Updated fragment (now includes resolved sub-problems)
-        # - Same depth (this is continuation, not a new sub-problem)
-        try:
-            newnode = TreeTraceNode(prompt=node.prompt, fragment=node.fragment+"\n\n"+reconstructed_output, depth=node.depth, index=node.index+1)
-            node.next = newnode
-            self._recursive_generate(newnode)
-            return node
-        except Exception as e:
-            raise Exception(f"Error continuing generation: {e}")
+        # If we broke out of the loop, all attempts failed
+        raise Exception(f"All {max_attempt} attempts failed. Last error: {last_error}")
 
 
 def AbymeHuggingFaceModel(model_name: str = "Abyme", **kwargs):
@@ -395,7 +261,7 @@ def AbymeHuggingFaceModel(model_name: str = "Abyme", **kwargs):
         **kwargs
     )
 
-def Abyme_API_Models(model: str, max_depth: int = 20, max_call: int = 50, max_parallel_workers: int = 1, print_progress: bool = False) -> RecursiveModel:
+def Abyme_API_Models(model: str, **args) -> RecursiveModel:
     
     if model == "deepseek":
         base_model = DeepSeekModel(system_prompt=magic_prompt)
@@ -411,8 +277,5 @@ def Abyme_API_Models(model: str, max_depth: int = 20, max_call: int = 50, max_pa
         base_model=base_model,
         guard_model=guard_model,
         formatter=magic_formatter,
-        max_depth=max_depth,
-        max_call=max_call,
-        max_parallel_workers=max_parallel_workers,
-        print_progress = print_progress
+        **args
     )

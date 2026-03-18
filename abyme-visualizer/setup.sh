@@ -1,53 +1,59 @@
 #!/bin/bash
 
-# Abyme Visualizer - Quick Setup Script
+# Abyme Visualizer - Setup Script
+# Installs dependencies and prepares the environment
+
+set -e  # Exit on error
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "========================================="
-echo "Abyme Visualizer Setup"
+echo "Abyme Visualizer - Setup"
 echo "========================================="
-echo ""
 
-# Check Python version
-echo "Checking Python version..."
-python3 --version
-
-# Create virtual environment if it doesn't exist
-if [ ! -d "venv" ]; then
-    echo ""
-    echo "Creating virtual environment..."
-    python3 -m venv venv
+# Check if Python is available
+if ! command -v python3 &> /dev/null && ! command -v python &> /dev/null; then
+    echo "Error: Python is not installed"
+    exit 1
 fi
 
-# Activate virtual environment and install dependencies
+# Use python3 if available, otherwise python
+PYTHON_CMD="python3"
+if ! command -v python3 &> /dev/null; then
+    PYTHON_CMD="python"
+fi
+
+echo "Using Python: $PYTHON_CMD"
+
+# Create virtual environment
 echo ""
-echo "Installing Python dependencies in venv..."
+echo "Creating virtual environment..."
+$PYTHON_CMD -m venv venv
+
+# Activate virtualenv
+echo "Activating virtual environment..."
 source venv/bin/activate
-pip install -r requirements.txt
-pip install openai  # For DeepSeek API
 
-# Check for DeepSeek API key
+# Upgrade pip
 echo ""
-if [ -z "$DEEPSEEK_API_KEY" ]; then
-    echo "⚠️  WARNING: DEEPSEEK_API_KEY not found in environment"
-    echo "Please set your API key:"
-    echo "  export DEEPSEEK_API_KEY='your-api-key-here'"
-    echo "  or add it to ../abyme-rllm/.env"
-else
-    echo "✓ DEEPSEEK_API_KEY found"
-fi
+echo "Upgrading pip..."
+pip install -q --upgrade pip
+
+# Install dependencies
+echo ""
+echo "Installing dependencies..."
+pip install -q -r requirements.txt
+
+# Install abyme-rllm in development mode
+echo ""
+echo "Installing abyme-rllm..."
+cd "$SCRIPT_DIR/../abyme-rllm"
+pip install -q -e .
 
 echo ""
 echo "========================================="
 echo "Setup complete!"
 echo "========================================="
 echo ""
-echo "To start the visualizer:"
-echo "  source venv/bin/activate"
-echo "  python app.py"
-echo ""
-echo "Or use the run.sh script:"
-echo "  ./run.sh"
-echo ""
-echo "Then open in your browser:"
-echo "  http://localhost:5000"
+echo "You can now run: ./visualize.sh"
 echo ""

@@ -213,27 +213,14 @@ def verify_format(trace: str) -> bool:
         >>> verify_format("Answer</think></think>")  # Multiple </think>
         False
     """
+    if not trace:
+        return True
 
     # Rule 2: No <think> opening tag allowed
     if f'<{THINK}>' in trace:
         return False
 
     # Rule 1: Check for incomplete tags - only valid tags are allowed
-    # Build patterns dynamically based on valid tags
-    for tag in VALID_TAGS:
-        # Check for incomplete opening tags (e.g., "<d" without "o>")
-        if len(tag) > 1:
-            for i in range(1, len(tag)):
-                incomplete_pattern = f'<{tag[:i]}(?![{tag[i]}])'
-                if re.search(incomplete_pattern, trace):
-                    return False
-
-        # Check for incomplete closing tags (e.g., "</d" without "o>")
-        if len(tag) > 1:
-            for i in range(1, len(tag)):
-                incomplete_pattern = f'</{tag[:i]}(?![{tag[i]}])'
-                if re.search(incomplete_pattern, trace):
-                    return False
 
     # Rule 3: Check RESPONSE, AND, and OR tags are properly paired and not nested
     for tag in [RESPONSE, AND, OR]:

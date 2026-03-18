@@ -48,7 +48,8 @@ class DeepSeekModel(Model):
     def __init__(
         self,
         reasoning: bool = False,
-        system_prompt: str = "You are a helpful AI assistant."
+        system_prompt: str = "You are a helpful AI assistant.",
+        temperature: float = 1.0
     ):
         """
         Initialize DeepSeek model.
@@ -56,11 +57,14 @@ class DeepSeekModel(Model):
         Args:
             reasoning: If True, uses deepseek-reasoner; otherwise uses deepseek-chat
             system_prompt: System prompt to use for all generations
+            temperature: Sampling temperature for the model
         """
         self.model_name = "deepseek-reasoner" if reasoning else "deepseek-chat"
         self.api_key = os.getenv("DEEPSEEK_API_KEY", "")
         self.base_url = "https://api.deepseek.com"
         self.system_prompt = system_prompt
+        self.temperature = temperature
+
 
         # Initialize OpenAI client for DeepSeek
         self.client = OpenAI(
@@ -90,7 +94,8 @@ class DeepSeekModel(Model):
                     messages=[
                         {"role": "system", "content": self.system_prompt},
                         {"role": "user", "content": prompt}
-                    ]
+                    ],
+                    temperature=self.temperature
                 )
                 content = response.choices[0].message.content
                 return content if content is not None else ""
@@ -153,4 +158,4 @@ class GPTModel(Model):
     
 class ErrorGuardModel(Model):
     def generate(self, prompt: str, max_retry:int) -> str:
-        return "You reached recursion limit, you must solve this problem your self and delegate no further"
+        return "</think> You reached recursion limit, you must solve this problem your self and delegate no further"

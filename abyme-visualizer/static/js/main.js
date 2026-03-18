@@ -1,313 +1,164 @@
 /**
- * Main coordinator for Abyme Visualizer
- * Handles WebSocket communication and coordinates between chat and tree visualization
+ * Main Application Coordinator
+ * Initializes and coordinates all modules
  */
 
-// Initialize components
-let socket;
-let treeViz;
-let chat;
-let isGenerating = false;
+import { logger } from './logger.js';
+import { SocketClient } from './socket_client.js';
+import { TreeRenderer } from './tree_renderer.js';
+import { Controls } from './controls.js';
+import { Sidebar } from './sidebar.js';
+import { Metrics } from './metrics.js';
 
-// Initialize when DOM is loaded
-document.addEventListener('DOMContentLoaded', () => {
-    // Initialize Socket.IO
-    socket = io();
+const MODULE = 'Main';
 
-    // Initialize UI components
-    treeViz = new TreeVisualizer('tree-svg');
-    chat = new ChatUI('messages');
+class AbymeVisualizer {
+    constructor() {
+        this.socket = null;
+        this.treeRenderer = null;
+        this.controls = null;
+        this.sidebar = null;
+        this.metrics = null;
+    }
 
-    // Setup WebSocket event handlers
-    setupSocketHandlers();
+    /**
+     * Initialize the application
+     */
+    init() {
+        logger.info(MODULE, '='.repeat(60));
+        logger.info(MODULE, 'Abyme Tree Visualizer Starting...');
+        logger.info(MODULE, '='.repeat(60));
 
-    // Setup UI event handlers
-    setupUIHandlers();
-});
+        // Initialize modules
+        this.metrics = new Metrics();
+        this.sidebar = new Sidebar();
+        this.treeRenderer = new TreeRenderer('tree-canvas', (node) => this.handleNodeClick(node));
+        this.controls = new Controls(
+            (params) => this.handleStart(params),
+            () => this.handleStop()
+        );
 
-/**
- * Setup WebSocket event handlers
- */
-function setupSocketHandlers() {
-    socket.on('connect', () => {
-        console.log('Connected to server');
-        updateConnectionStatus(true);
-    });
+        // Initialize WebSocket
+        this.socket = new SocketClient();
+        this.socket.connect();
 
-    socket.on('disconnect', () => {
-        console.log('Disconnected from server');
-        updateConnectionStatus(false);
-    });
+        // Register WebSocket event handlers
+        this.registerSocketEvents();
 
-    socket.on('connected', (data) => {
-        console.log('Server ready:', data);
-        updateStatus('Ready');
-    });
+        logger.info(MODULE, 'Application initialized successfully');
+    }
 
-    socket.on('node_start', (data) => {
-        const promptPreview = data.prompt.substring(0, 60) + (data.prompt.length > 60 ? '...' : '');
-        console.log(`🔄 [Depth ${data.depth}] Node start: ${promptPreview}`);
-        treeViz.addNode(data);
-    });
+    /**
+     * Register WebSocket event handlers
+     */
+    registerSocketEvents() {
+        // Tree update events
+        this.socket.on('tree_update', (data) => {
+            logger.info(MODULE, 'Received tree_update', data);
 
-    socket.on('node_waiting', (data) => {
-        const outputPreview = data.output.substring(0, 60) + (data.output.length > 60 ? '...' : '');
-        console.log(`⏳ Waiting for ${data.num_subproblems} subproblems: ${outputPreview}`);
-        treeViz.setNodeWaiting(data.node_id, data.output, data.num_subproblems);
-    });
+            // Update tree visualization
+            if (data.tree && data.tree.nodes && data.tree.edges) {
+                this.treeRenderer.updateTree(data.tree.nodes, data.tree.edges);
+            }
 
-    socket.on('node_complete', (data) => {
-        const outputPreview = data.output.substring(0, 60) + (data.output.length > 60 ? '...' : '');
-        console.log(`✓ [${data.latency.toFixed(2)}s] Node complete: ${outputPreview}`);
-        treeViz.completeNode(data.node_id, data.output, data.latency);
-    });
+            // Update metrics
+            if (data.metrics) {
+                this.metrics.update(data.metrics);
 
-    socket.on('subproblem_created', (data) => {
-        console.log(`├─ Subproblem delegation created`);
-        treeViz.addEdge(data.parent_id, data.child_id, 'subproblem');
-    });
+                if (data.metrics.is_finished) {
+                    this.handleGenerationComplete();
+                }
+            }
+        });
 
-    socket.on('continuation_created', (data) => {
-        console.log(`➡️  Continuation created`);
-        treeViz.addEdge(data.node_id, data.next_id, 'continuation');
-    });
+        // Generation started
+        this.socket.on('generation_started', (data) => {
+            logger.info(MODULE, 'Generation started', data);
+            this.metrics.setStatus('Generating...', 'status-generating');
+        });
 
-    socket.on('node_final', (data) => {
-        console.log(`🏁 Final node reached`);
-        treeViz.finalizeNode(data.node_id);
-    });
+        // Generation complete
+        this.socket.on('generation_complete', (data) => {
+            logger.info(MODULE, 'Generation complete', data);
+            this.handleGenerationComplete();
+            this.metrics.setStatus('Complete', 'status-complete');
 
-    socket.on('generation_done', (data) => {
-        console.log('═'.repeat(60));
-        console.log('✅ Generation complete!');
-        console.log(`📊 Stats: ${data.stats.total_calls} calls | Depth ${data.stats.max_depth} | ${data.stats.latency.toFixed(2)}s`);
-        console.log('═'.repeat(60));
+            if (data.final_output) {
+                logger.info(MODULE, 'Final output:', data.final_output);
+            }
+        });
 
-        chat.removeStatusMessage();
-        chat.addAssistantMessage(data.final_output);
+        // Generation stopped
+        this.socket.on('generation_stopped', (data) => {
+            logger.info(MODULE, 'Generation stopped', data);
+            this.handleGenerationComplete();
+            this.metrics.setStatus('Stopped', 'status-stopped');
+        });
 
-        updateStatus('Ready');
-        updateFinalStats(data.stats);
+        // Generation error
+        this.socket.on('generation_error', (data) => {
+            logger.error(MODULE, 'Generation error', data);
+            this.handleGenerationComplete();
+            this.metrics.setStatus('Error', 'status-error');
 
-        isGenerating = false;
-        updateSendButton();
-    });
-
-    socket.on('error', (data) => {
-        console.error('❌ Error:', data.message);
-        chat.addErrorMessage(data.message);
-
-        updateStatus('Error');
-
-        isGenerating = false;
-        updateSendButton();
-    });
-
-    socket.on('generation_stopped', (data) => {
-        console.log('⏸️  Generation stopped:', data.message);
-    });
-}
-
-/**
- * Setup UI event handlers
- */
-function setupUIHandlers() {
-    const sendBtn = document.getElementById('send-btn');
-    const stopBtn = document.getElementById('stop-btn');
-    const promptInput = document.getElementById('prompt-input');
-    const maxDepthSlider = document.getElementById('max-depth-slider');
-    const maxCallSlider = document.getElementById('max-call-slider');
-    const maxDepthValue = document.getElementById('max-depth-value');
-    const maxCallValue = document.getElementById('max-call-value');
-
-    // Send button click
-    sendBtn.addEventListener('click', () => {
-        sendPrompt();
-    });
-
-    // Stop button click
-    if (stopBtn) {
-        stopBtn.addEventListener('click', () => {
-            stopGeneration();
+            if (data.error_message) {
+                alert(`Error: ${data.error_message}`);
+            }
         });
     }
 
-    // Enter key in textarea (Ctrl+Enter or Cmd+Enter to send)
-    promptInput.addEventListener('keydown', (event) => {
-        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-            event.preventDefault();
-            sendPrompt();
-        }
-    });
+    /**
+     * Handle start button click
+     * @param {object} params - Generation parameters
+     */
+    handleStart(params) {
+        logger.info(MODULE, 'Starting generation', params);
 
-    // Max depth slider
-    if (maxDepthSlider && maxDepthValue) {
-        maxDepthSlider.addEventListener('input', (event) => {
-            maxDepthValue.textContent = event.target.value;
-        });
+        // Clear previous tree
+        this.treeRenderer.clear();
+        this.metrics.reset();
+        this.metrics.setStatus('Starting...', 'status-starting');
+
+        // Send generation request
+        this.socket.sendGenerateRequest(params);
     }
 
-    // Max call slider
-    if (maxCallSlider && maxCallValue) {
-        maxCallSlider.addEventListener('input', (event) => {
-            maxCallValue.textContent = event.target.value;
-        });
-    }
-}
-
-/**
- * Send prompt to server
- */
-function sendPrompt() {
-    const promptInput = document.getElementById('prompt-input');
-    const prompt = promptInput.value.trim();
-
-    if (!prompt || isGenerating) {
-        return;
+    /**
+     * Handle stop button click
+     */
+    handleStop() {
+        logger.info(MODULE, 'Stopping generation');
+        this.socket.sendStopRequest();
+        this.metrics.setStatus('Stopping...', 'status-stopping');
     }
 
-    // Get slider values
-    const maxDepth = parseInt(document.getElementById('max-depth-slider').value);
-    const maxCall = parseInt(document.getElementById('max-call-slider').value);
+    /**
+     * Handle generation complete (re-enable controls)
+     */
+    handleGenerationComplete() {
+        logger.info(MODULE, 'Generation completed - re-enabling controls');
+        this.controls.setGenerating(false);
+    }
 
-    // Add user message to chat
-    chat.addUserMessage(prompt);
-    chat.addStatusMessage('Generating...');
-
-    // Reset tree visualization
-    treeViz.reset();
-
-    // Update status
-    updateStatus('Generating...');
-    isGenerating = true;
-    updateSendButton();
-
-    // Send to server
-    console.log('🚀 Starting generation...');
-    console.log('Config:', { max_depth: maxDepth, max_call: maxCall, max_parallel_workers: 10 });
-
-    socket.emit('generate', {
-        prompt: prompt,
-        config: {
-            max_depth: maxDepth,
-            max_call: maxCall,
-            max_parallel_workers: 10  // Updated to 10 workers
-        }
-    });
-
-    // Clear input
-    promptInput.value = '';
-}
-
-/**
- * Update connection status indicator
- */
-function updateConnectionStatus(connected) {
-    const statusDot = document.getElementById('connection-status');
-    const statusText = document.getElementById('connection-text');
-
-    if (statusDot && statusText) {
-        if (connected) {
-            statusDot.classList.remove('bg-gray-500');
-            statusDot.classList.add('bg-green-500');
-            statusText.textContent = 'Connected';
-        } else {
-            statusDot.classList.remove('bg-green-500');
-            statusDot.classList.add('bg-gray-500');
-            statusText.textContent = 'Disconnected';
-        }
+    /**
+     * Handle node click (show sidebar)
+     * @param {object} node - Node data
+     */
+    handleNodeClick(node) {
+        logger.info(MODULE, 'Node clicked, showing sidebar', node);
+        this.sidebar.showNodeDetail(node);
     }
 }
 
 /**
- * Update status text
+ * Application entry point
  */
-function updateStatus(text) {
-    const statusElem = document.getElementById('status');
-    if (statusElem) {
-        statusElem.textContent = text;
+export function initApp() {
+    const app = new AbymeVisualizer();
+    app.init();
 
-        // Update color based on status
-        statusElem.className = 'font-medium';
-        if (text === 'Ready' || text === 'Connected') {
-            statusElem.classList.add('text-green-400');
-        } else if (text === 'Generating...') {
-            statusElem.classList.add('text-yellow-400');
-        } else if (text === 'Error') {
-            statusElem.classList.add('text-red-400');
-        } else {
-            statusElem.classList.add('text-gray-400');
-        }
-    }
-}
+    // Expose to window for debugging
+    window.AbymeVisualizer = app;
 
-/**
- * Update final stats after generation complete
- */
-function updateFinalStats(stats) {
-    const callCountElem = document.getElementById('call-count');
-    const currentDepthElem = document.getElementById('current-depth');
-
-    if (callCountElem && stats.total_calls !== undefined) {
-        callCountElem.textContent = stats.total_calls;
-    }
-
-    if (currentDepthElem && stats.max_depth !== undefined) {
-        currentDepthElem.textContent = stats.max_depth;
-    }
-
-    console.log('Final stats:', stats);
-}
-
-/**
- * Update send button state
- */
-function updateSendButton() {
-    const sendBtn = document.getElementById('send-btn');
-    const stopBtn = document.getElementById('stop-btn');
-    const maxDepthSlider = document.getElementById('max-depth-slider');
-    const maxCallSlider = document.getElementById('max-call-slider');
-
-    if (sendBtn) {
-        if (isGenerating) {
-            sendBtn.disabled = true;
-            sendBtn.textContent = 'Generating...';
-        } else {
-            sendBtn.disabled = false;
-            sendBtn.textContent = 'Send';
-        }
-    }
-
-    if (stopBtn) {
-        if (isGenerating) {
-            stopBtn.classList.remove('hidden');
-        } else {
-            stopBtn.classList.add('hidden');
-        }
-    }
-
-    // Lock/unlock sliders
-    if (maxDepthSlider) {
-        maxDepthSlider.disabled = isGenerating;
-    }
-    if (maxCallSlider) {
-        maxCallSlider.disabled = isGenerating;
-    }
-}
-
-/**
- * Stop the current generation
- */
-function stopGeneration() {
-    if (!isGenerating) return;
-
-    console.log('⏸️  Stop requested - disconnecting from updates...');
-    socket.emit('stop_generation');
-
-    chat.removeStatusMessage();
-    chat.addErrorMessage('Generation stopped by user (server may still be running background tasks)');
-    updateStatus('Stopped');
-
-    isGenerating = false;
-    updateSendButton();
+    logger.info(MODULE, 'Application ready!');
 }

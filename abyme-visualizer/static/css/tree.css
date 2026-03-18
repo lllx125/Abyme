@@ -1,0 +1,95 @@
+/**
+ * Tree Canvas Styles
+ * D3.js SVG tree visualization styles
+ */
+
+.tree-container {
+    flex: 1;
+    background-color: #1a1a1a;
+    position: relative;
+    overflow: hidden;
+}
+
+#tree-canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+/* Edges */
+.edge {
+    opacity: 0.8;
+    transition: opacity 0.3s;
+}
+
+.edge:hover {
+    opacity: 1;
+}
+
+.edge-and {
+    stroke: #FF69B4;
+    stroke-width: 2;
+    filter: url(#glow);
+}
+
+.edge-or {
+    stroke: #00FF00;
+    stroke-width: 2;
+    filter: url(#glow);
+}
+
+.edge-past {
+    stroke: #FFFFFF;
+    stroke-width: 1.5;
+    filter: url(#glow);
+}
+
+/* Nodes */
+.node-group {
+    transition: transform 0.3s ease, opacity 0.3s ease;
+}
+
+.node-group:hover circle {
+    stroke-width: 3;
+    filter: drop-shadow(0 0 8px rgba(255, 255, 255, 0.6));
+}
+
+.node-group circle {
+    transition: all 0.3s ease;
+}
+
+/* Pulsing animation for GENERATING status */
+.pulsing {
+    animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% {
+        opacity: 0.6;
+        filter: drop-shadow(0 0 5px #FFD700);
+    }
+    50% {
+        opacity: 1;
+        filter: drop-shadow(0 0 15px #FFD700);
+    }
+}
+
+/* Tooltip */
+.tree-tooltip {
+    position: absolute;
+    background: rgba(0, 0, 0, 0.9);
+    color: white;
+    padding: 10px;
+    border-radius: 5px;
+    font-size: 12px;
+    pointer-events: none;
+    z-index: 1000;
+    max-width: 300px;
+    word-wrap: break-word;
+    border: 1px solid #555;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.5);
+}
+
+.tree-tooltip strong {
+    color: #4CAF50;
+}

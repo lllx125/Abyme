@@ -1,203 +1,204 @@
-# Abyme Visualizer
+# Abyme Tree Visualizer
 
-Real-time chat interface with dynamic tree visualization for the Abyme recursive model.
+Real-time visualization of Abyme recursive model generation trees with interactive D3.js interface.
 
 ## Features
 
-- **ChatGPT-style interface** - Enter prompts and see responses in a familiar chat UI
-- **Real-time tree growth** - Watch the recursive generation tree build dynamically
-- **Color-coded nodes**:
-  - 🟡 **Yellow** - Currently generating
-  - 🔵 **Blue** - Generation complete (not final)
-  - 🟢 **Green** - Final node (leaf)
-- **Interactive features**:
-  - Click any node to view full details in sidebar
-  - Hover over nodes for quick preview
-  - Zoom & pan to navigate large trees
-  - Stop button to halt generation
-- **Smart tree layout**:
-  - First child directly below parent
-  - Siblings positioned to avoid overlap
-  - Continuation arrows show sequential flow
-- **Markdown rendering** - Formatted text in node details
+- **Real-time Tree Visualization**: Live updates as the model generates (throttled to 10 FPS)
+- **Interactive Controls**: Adjust max_depth, max_call, max_chain_length, and max_parallel_workers
+- **Node States**: Visual representation of all node statuses with color coding
+- **Edge Types**: Distinct styles for AND (pink), OR (lime), and PAST (white arrow) edges
+- **Hover Tooltips**: Preview prompt and output on node hover
+- **Detail Sidebar**: Click nodes to view full prompt and output in markdown format
+- **Stop Capability**: Gracefully cancel generation mid-flight
+- **Console Logging**: All events logged to browser console for debugging
 
-## Quick Start (Easiest Way)
+## Quick Start (One Command!)
 
-From anywhere in the Abyme project:
+From the Abyme root directory:
 
 ```bash
 ./visualize.sh
 ```
 
-Or from the visualizer directory:
+This script will:
+- Create a virtual environment (first run only)
+- Install all dependencies automatically
+- Install abyme-rllm in development mode
+- Start the Flask server on `http://localhost:5000`
 
-```bash
-./run
-```
+Then just open your browser to `http://localhost:5000`!
 
-That's it! The script will automatically:
-- Set up the virtual environment (first time only)
-- Install dependencies (first time only)
-- Start the server
+## Manual Installation (Optional)
 
-Then open **http://localhost:5000** in your browser.
+If you prefer to set up manually:
 
-## Manual Installation (If Needed)
-
-### 1. Install Python dependencies
+### 1. Install Python Dependencies
 
 ```bash
 cd /home/lilixing/Abyme/abyme-visualizer
 pip install -r requirements.txt
 ```
 
-### 2. Ensure Abyme is installed
-
-The visualizer uses the `abyme-rllm` package from the parent directory. Make sure you have:
-- DeepSeek API key in your environment (`.env` file or `DEEPSEEK_API_KEY` variable)
-
-### 3. Run the server
+### 2. Install Abyme
 
 ```bash
-source venv/bin/activate
+cd /home/lilixing/Abyme/abyme-rllm
+pip install -e .
+```
+
+### 3. Start the Server
+
+```bash
+cd /home/lilixing/Abyme/abyme-visualizer
 python app.py
 ```
 
 The server will start on `http://localhost:5000`
 
-## Usage
+### 4. Open in Browser
 
-### On WSL (Windows)
+Navigate to `http://localhost:5000` in your web browser.
 
-1. Run the launcher:
-   ```bash
-   ./run
-   ```
+### 3. Using the Interface
 
-2. Open your Windows browser and navigate to:
-   ```
-   http://localhost:5000
-   ```
+#### Left Control Panel:
+- **Prompt**: Enter your problem/question
+- **Model**: Select model (deepseek, gpt, or deepseek-r)
+- **Max Depth**: Maximum recursion depth (1-20)
+- **Max Calls**: Maximum total API calls (100-5000)
+- **Max Chain Length**: Maximum continuation chain (1-10)
+- **Max Workers**: Parallel worker threads (1-50)
 
-### Sending Prompts
+#### Tree Visualization:
+- **Pan**: Click and drag to move around
+- **Zoom**: Scroll to zoom in/out
+- **Hover**: See node preview tooltip
+- **Click**: Open detail sidebar with full content
 
-1. Type your problem or question in the text area at the bottom left
-2. Click **Send** or press **Ctrl+Enter** (Windows) / **Cmd+Enter** (Mac)
-3. Watch the tree grow in real-time on the right panel
-4. The final answer will appear in the chat
+#### Node Status Colors:
+- **Grey**: WAIT_GEN (waiting to generate)
+- **Yellow (pulsing)**: GENERATING (actively generating)
+- **Orange-red**: WAIT_SUB (waiting for subproblems)
+- **Blue**: COMPLETED (generation completed)
+- **Green**: FINAL (final state, no more work)
+- **Red**: FAILED (generation failed)
+- **Dark grey**: CANCELLED (cancelled by OR node)
 
-### Interacting with the Tree
+#### Edge Types:
+- **Pink (glowing)**: AND edges (all children required)
+- **Lime (glowing)**: OR edges (first successful child)
+- **White arrow (glowing)**: PAST edges (temporal continuation)
 
-- **Hover** over any node to see its details (prompt, context, output, latency)
-- **Scroll** to zoom in/out
-- **Click and drag** to pan around the tree
-- Nodes change color as they progress:
-  - Yellow → Red → Green (for leaf nodes)
+## Architecture
 
-## Configuration
+### Backend (Python)
+- **app.py**: Flask application entry point
+- **config.py**: Configuration settings
+- **visualizer/tree_manager_events.py**: VisualizerTreeManager (emits events)
+- **visualizer/event_emitter.py**: ThrottledEventEmitter (100ms throttle)
+- **visualizer/tree_serializer.py**: Thread-safe tree serialization
+- **visualizer/model_wrapper.py**: StoppableRecursiveModel (graceful stop)
+- **routes/main.py**: Main page route
+- **routes/websocket.py**: WebSocket event handlers
 
-You can adjust the model parameters by editing [main.js](static/js/main.js#L128):
+### Frontend (JavaScript ES6 Modules)
+- **main.js**: Application coordinator
+- **socket_client.js**: Socket.IO wrapper
+- **tree_renderer.js**: D3.js visualization
+- **controls.js**: Input/slider/button handlers
+- **sidebar.js**: Detail sidebar with markdown
+- **metrics.js**: Call count display
+- **logger.js**: Console logging utility
 
-```javascript
-config: {
-    max_depth: 5,           // Maximum recursion depth
-    max_call: 100,          // Maximum total API calls
-    max_parallel_workers: 4 // Parallel subproblem processing
-}
-```
+### Styles (CSS)
+- **style.css**: Global styles and layout
+- **controls.css**: Control panel styles
+- **tree.css**: Tree canvas and node/edge styles
+- **sidebar.css**: Detail sidebar and markdown styles
 
-## Project Structure
+## WebSocket Events
 
-```
-abyme-visualizer/
-├── app.py                  # Flask server with SocketIO
-├── requirements.txt        # Python dependencies
-├── README.md              # This file
-├── templates/
-│   └── index.html         # Main UI
-└── static/
-    ├── css/
-    │   └── style.css      # Custom styles & animations
-    └── js/
-        ├── main.js        # WebSocket coordinator
-        ├── chat.js        # Chat UI component
-        └── tree.js        # D3.js tree visualization
-```
+### Client → Server
+- `generate_request`: Start generation with parameters
+- `stop_generation`: Stop current generation
 
-## How It Works
+### Server → Client
+- `tree_update`: Tree data + metrics (throttled to 100ms)
+- `generation_started`: Generation has begun
+- `generation_complete`: Generation finished successfully
+- `generation_stopped`: Generation was stopped by user
+- `generation_error`: Error occurred during generation
 
-1. **User sends prompt** → WebSocket message to Flask server
-2. **Server creates Abyme_DeepSeek model** with event wrapping
-3. **As generation happens**, server emits events:
-   - `node_start` - New node created (yellow)
-   - `node_complete` - Node generated (red)
-   - `subproblem_created` - Edge added (parent → child)
-   - `continuation_created` - Edge added (node → next)
-   - `node_final` - Leaf node marked (green)
-   - `generation_done` - Final answer ready
-4. **Frontend receives events** → Updates tree visualization in real-time
-5. **Final answer displayed** in chat
+## Thread Safety
 
-## Troubleshooting
+The visualizer implements several thread-safety mechanisms:
 
-### Port already in use
-If port 5000 is already in use, edit [app.py](app.py#L174):
-```python
-socketio.run(app, host='0.0.0.0', port=5001, debug=True)
-```
-
-### Connection issues on WSL
-- Ensure Windows firewall allows the connection
-- Try accessing via `http://127.0.0.1:5000` instead of `localhost`
-
-### DeepSeek API errors
-- Check that `DEEPSEEK_API_KEY` is set in your environment
-- Verify your API key is valid and has credits
-
-### Tree not updating
-- Check browser console for JavaScript errors
-- Verify WebSocket connection status (green dot in bottom left)
-- Ensure Flask server is running without errors
-
-## Example Prompts
-
-Try these to see the tree visualization:
-
-**Math problem:**
-```
-Find the derivative of f(x) = (x^2 + 1)^(x^3) using logarithmic differentiation
-```
-
-**Logic puzzle:**
-```
-If all bloops are razzies and all razzies are lazzies, are all bloops definitely lazzies?
-```
-
-**Complex reasoning:**
-```
-Can a square be partitioned into an odd number of triangles of equal area?
-```
+1. **Lock-Protected Serialization**: `draw_tree()` calls hold `manager.lock` to prevent concurrent modifications
+2. **Event Throttling**: Updates coalesced to max 10/second to avoid overwhelming WebSocket
+3. **Cooperative Cancellation**: Workers check `stop_requested` Event at every iteration
+4. **Full Snapshots**: Send complete tree state (not deltas) to avoid sync issues
 
 ## Development
 
-### Adding new features
+### Running in Debug Mode
 
-The code is modular:
-- **Backend events**: Modify [app.py](app.py) `create_model_with_events()`
-- **Tree layout**: Edit [tree.js](static/js/tree.js) `calculatePositions()`
-- **UI styling**: Update [style.css](static/css/style.css)
-
-### Debugging
-
-Enable debug mode in the browser console:
-```javascript
-socket.on('node_start', (data) => {
-    console.log('Node started:', data);
-});
+```bash
+export FLASK_ENV=development
+python app.py
 ```
 
-Server logs show all events being emitted.
+### Viewing Console Logs
+
+Open browser DevTools (F12) and check the Console tab. All events are logged with timestamps and color-coded severity levels.
+
+### Modifying Throttle Interval
+
+Edit `config.py`:
+
+```python
+TREE_UPDATE_THROTTLE_INTERVAL = 0.1  # 100ms = ~10 FPS
+```
+
+## Troubleshooting
+
+### Port Already in Use
+
+If port 5000 is already in use, modify [app.py:56](app.py:56):
+
+```python
+socketio.run(app, host='0.0.0.0', port=5001)
+```
+
+### WebSocket Connection Failed
+
+Check that:
+1. Flask server is running
+2. No firewall blocking port 5000
+3. Browser console shows connection attempt
+
+### Tree Not Updating
+
+Check browser console for:
+1. WebSocket connection status
+2. `tree_update` events being received
+3. Any JavaScript errors
+
+### Stop Button Not Working
+
+Verify in console that:
+1. `stop_generation` event is emitted
+2. Backend logs show stop signal received
+3. Workers are exiting gracefully
 
 ## License
 
-Part of the Abyme project.
+MIT License - See parent Abyme project for details.
+
+## Credits
+
+Built with:
+- Flask + Flask-SocketIO (backend)
+- D3.js v7 (visualization)
+- Socket.IO (WebSocket)
+- Marked.js + DOMPurify (markdown rendering)
