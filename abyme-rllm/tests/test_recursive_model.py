@@ -1,18 +1,6 @@
-import sys
-import os
-
-# 1. Get the absolute path to the directory containing 'main.py'
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
-# 2. Get the path to the parent directory (project_root)
-parent_dir = os.path.dirname(current_dir)
-
-# 3. Add the parent directory to sys.path
-sys.path.append(parent_dir)
-
+import time
 from abyme.core import *
 from abyme.tree_trace import *
-import time
 
 prompt = r"Each vertex of a regular octagon is independently colored either red or blue with equal probability. The probability that the octagon can then be rotated so that all of the blue vertices end up at positions where there were originally red vertices is $\\tfrac{m}{n}$, where $m$ and $n$ are relatively prime positive integers. What is $m+n$?\n\nPlease provide your final answer in the format \\boxed{answer}, where answer is an integer between 0 and 999. You have no access to coding so you may not use any brute force methods"
 #prompt = r"Let $ABCDE$ be a convex pentagon with $AB=14, BC=7, CD=24, DE=13, EA=26,$ and $\\angle B=\\angle E=60^\\circ$. For each point $X$ in the plane, define $f(X)=AX+BX+CX+DX+EX$. The least possible value of $f(X)$ can be expressed as $m+n\\sqrt{p}$, where $m$ and $n$ are positive integers and $p$ is not divisible by the square of any prime. Find $m+n+p$.\n\nPlease provide your final answer in the format \\boxed{answer}, where answer is an integer between 0 and 999.  You have no access to coding so you may not use any brute force methods"
@@ -22,7 +10,7 @@ prompt = r"Each vertex of a regular octagon is independently colored either red 
 
 def main():
     # Changed Abyme_DeepSeek to Abyme_API_Models to match your function definition
-    model = Abyme_API_Models(
+    model = Abyme_API_Model(
         model="deepseek", 
         print_progress=True, 
         max_parallel_workers=10, 

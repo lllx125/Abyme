@@ -8,8 +8,33 @@ Abyme is a recursive model architecture that enables language models to decompos
 
 ## Installation
 
+### Basic Installation (API models only)
+For using OpenAI/DeepSeek API models without PyTorch:
 ```bash
 pip install -e .
+```
+
+### With PyTorch Support (for local HuggingFace models)
+```bash
+pip install -e ".[pytorch]"
+```
+
+### With SFT Training Support
+For supervised fine-tuning with all training dependencies:
+```bash
+pip install -e ".[sft]"
+```
+
+### Development Installation
+For development with testing and linting tools:
+```bash
+pip install -e ".[dev]"
+```
+
+### Full Installation
+Install everything:
+```bash
+pip install -e ".[all]"
 ```
 
 ## Quick Start

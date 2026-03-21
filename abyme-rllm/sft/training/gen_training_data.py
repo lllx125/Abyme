@@ -1,7 +1,12 @@
-import os, sys, json
+import os
+import json
+import time
 from typing import Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import product
+from abyme.model import DeepSeekModel
+from abyme.utils import verify_format
+from ..prompts import *
 
 MAX_WORKERS = 50
 DATA_PATH = "data/sft_training_data.jsonl"
@@ -11,20 +16,6 @@ TARGET_HIERARCHY = ["main","sub","sub-sub"] # "main","sub" or "sub-sub"
 TARGET_ACTION = ["ANSWER","AND","OR"]
 TARGET_STATE = ["first","continue","fail"]
 NUM_SAMPLES_NEEDED = 25
-
-# 1. Get the absolute path to the directory containing 'main.py'
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
-# 2. Get the path to the parent directory (project_root)
-parent_dir = os.path.dirname(current_dir)
-
-# 3. Add the parent directory to sys.path
-sys.path.append(parent_dir)
-
-from abyme.model import DeepSeekModel
-from abyme.utils import verify_format
-from prompts import *
-import time
 
 def clean_and_parse_llm_json(llm_output: str) -> Dict[str, str]:
     """Cleans markdown artifacts and parses the JSON output."""

@@ -122,7 +122,7 @@ def fold(node: TreeTraceNode, func: Callable[[TreeTraceNode, List[Any], List[Any
 
 
 def flatten_trace(node: TreeTraceNode) -> List[Tuple[str, str, str, str, str]]:
-    """Returns a list of (prompt, fragment, parent_problem, main_problem, output) for all generations."""
+    """Returns a list of (prompt, main_problem, parent_problem, fragment, output) for all generations."""
     # Retrieve the main problem from the root
     curr = node
     while curr.parent is not None:
@@ -134,7 +134,7 @@ def flatten_trace(node: TreeTraceNode) -> List[Tuple[str, str, str, str, str]]:
         for pr in p_res: res.extend(pr)
         
         parent_prompt = n.parent.prompt if n.parent else "None"
-        res.append((n.prompt, n.fragment, parent_prompt, main_problem, n.output))
+        res.append((n.prompt, main_problem, parent_prompt, n.fragment, n.output))
         
         for sr in s_res: res.extend(sr)
         return res
@@ -159,6 +159,23 @@ def parallel_latency(node: TreeTraceNode) -> float:
             sub_time = 0.0
             
         return node_time + sub_time
+        
+    return fold(node, agg)
+
+def length(node: TreeTraceNode) -> float:
+    """Calculates the minimum execution latency assuming infinite concurrent workers."""
+    def agg(n: TreeTraceNode, p_res: List[int], s_res: List[int]) -> int:
+        node_L = sum(p_res) + len(n.output)
+        if not s_res:
+            sub_L = 0
+        elif n.type == AND:
+            sub_L = max(s_res)  # Must wait for all AND children
+        elif n.type == OR:
+            sub_L = min(s_res)  # Only wait for the fastest OR child
+        else:
+            sub_L = 0
+            
+        return node_L + sub_L
         
     return fold(node, agg)
 
@@ -207,6 +224,30 @@ def nodes_per_level(node: TreeTraceNode) -> Dict[int, int]:
             for depth, count in res_dict.items():
                 counts[depth] = counts.get(depth, 0) + count
         return counts
+    return fold(node, agg)
+
+def to_dict(node: TreeTraceNode) -> dict:
+    """
+    Converts the entire tree trace into a nested JSON-serializable dictionary.
+    Preserves both the spatial (subproblems) and temporal (past) structures.
+    """
+    def agg(n: TreeTraceNode, p_res: list, s_res: list) -> dict:
+        return {
+            "prompt": n.prompt,
+            "fragment": n.fragment,
+            "output": n.output,
+            "type": n.type,
+            "status": n.status,
+            "difficulty": n.difficulty,
+            "depth": n.depth,
+            "index": n.index,
+            "latency": round(n.latency, 4),
+            "error_message": n.error_message,
+            "is_cancelled": n.is_cancelled,
+            "past": p_res,           # The folded list of past temporal nodes
+            "subproblems": s_res     # The folded list of spatial child nodes
+        }
+    
     return fold(node, agg)
 
 def draw_tree(

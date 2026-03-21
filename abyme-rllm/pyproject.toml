@@ -1,0 +1,152 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abyme"
+version = "0.1.0"
+description = "Recursive Language Model with XML-based elaboration system for advanced reasoning"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Abyme Research Team", email = "contact@abyme.ai"}
+]
+keywords = [
+    "language-model",
+    "recursive-reasoning",
+    "llm",
+    "transformers",
+    "ai",
+    "machine-learning"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "openai>=1.0.0",
+    "python-dotenv>=1.2.2",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+pytorch = [
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+    "accelerate>=0.25.0",
+    "bitsandbytes>=0.41.0",
+    "peft>=0.7.0",
+]
+
+sft = [
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+    "accelerate>=0.25.0",
+    "bitsandbytes>=0.41.0",
+    "peft>=0.7.0",
+    "datasets>=2.14.0",
+    "pandas>=2.0.0",
+    "scipy>=1.10.0",
+    "trl>=0.7.0",
+]
+
+training = [
+    "transformers==4.56.2",
+    "trl==0.22.2",
+    "datasets",
+    "huggingface_hub",
+    "peft",
+    "accelerate",
+    "bitsandbytes",
+]
+
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+
+all = [
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+    "accelerate>=0.25.0",
+    "bitsandbytes>=0.41.0",
+    "peft>=0.7.0",
+    "datasets>=2.14.0",
+    "pandas>=2.0.0",
+    "scipy>=1.10.0",
+    "trl>=0.7.0",
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Abyme/abyme"
+Documentation = "https://github.com/Abyme/abyme#readme"
+Repository = "https://github.com/Abyme/abyme"
+"Bug Reports" = "https://github.com/Abyme/abyme/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["abyme*", "sft*", "benchmark*", "tests*"]
+
+[tool.setuptools.package-data]
+abyme = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311"]
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+  | deprecated
+)/
+'''
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --strict-markers"
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.flake8]
+max-line-length = 100
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".venv",
+    "deprecated"
+]
+ignore = ["E203", "W503"]

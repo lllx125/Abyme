@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, TYPE_CHECKING
 
 # Assuming these are imported from your project structure
-from .utils import default_formatter, verify_format
+from .utils import verify_format
 from .tree_trace import TreeTraceNode
 from .tree_manager import TreeManager
 from .model import Model, DeepSeekModel, GPTModel, ErrorGuardModel
@@ -33,11 +33,11 @@ class RecursiveModel(Model):
                  guard_model: Optional[Model] = None,
                  max_depth: int = 20,
                  max_call: int = 50,
-                 max_parallel_workers: int = 4,
+                 max_parallel_workers: int = 1,
                  max_subproblem_retry: int = 2,
                  max_chain_length: int = 5,
                  proceed_when_fail: bool = True,
-                 formatter: Callable[[str, str, str, str], str] = default_formatter,
+                 formatter: Callable[[str, str, str, str], str] = magic_formatter,
                  print_progress: bool = False):
         """
         Initialize the multi-threaded recursive model.
@@ -199,69 +199,7 @@ class RecursiveModel(Model):
         # If we broke out of the loop, all attempts failed
         raise Exception(f"All {max_attempt} attempts failed. Last error: {last_error}")
 
-
-def AbymeHuggingFaceModel(model_name: str = "Abyme", **kwargs):
-    """
-    Factory function to create a HuggingFaceModel with Abyme special tokens.
-
-    This loads a model with custom tokenizer that includes special tokens for
-    recursive reasoning: <elaborate>, </elaborate>, <response>, </response>, </run>.
-
-    Args:
-        model_name: HuggingFace model identifier or local path (default: "Abyme")
-        **kwargs: All arguments supported by HuggingFaceModel:
-            - system_prompt: System prompt for the model
-            - device: Device to load on ("cuda", "cpu", etc.)
-            - torch_dtype: Data type for weights
-            - load_in_8bit/load_in_4bit: Quantization options
-            - trust_remote_code: Whether to trust remote code
-            - generation_config: Dict of generation parameters
-            - model_kwargs: Additional model loading arguments
-            - use_chat_template: Whether to use chat template
-            - chat_template: Custom chat template string
-
-    Returns:
-        HuggingFaceModel instance with special tokens injected
-
-    Example:
-        >>> model = AbymeHuggingFaceModel(
-        ...     model_name="meta-llama/Llama-2-7b-chat-hf",
-        ...     load_in_4bit=True,
-        ...     system_prompt="You are a helpful assistant."
-        ... )
-    """
-    # Lazy import torch/transformers only when HuggingFace model is used
-    import torch
-    from transformers import PreTrainedTokenizerBase, AutoModelForCausalLM, BitsAndBytesConfig
-    from .tokenization import setup_model_and_tokenizer, get_stopping_token_id, inject_special_tokens
-    from .pytorch_modules import HuggingFaceModel
-
-    # Extract model_kwargs and merge with remaining kwargs
-    model_kwargs = kwargs.pop('model_kwargs', {})
-
-    # Merge all kwargs for setup_model_and_tokenizer
-    setup_kwargs = {**kwargs, **model_kwargs}
-
-    # Remove parameters that aren't for model loading
-    setup_kwargs.pop('system_prompt', None)
-    setup_kwargs.pop('generation_config', None)
-    setup_kwargs.pop('tokenizer_kwargs', None)
-    setup_kwargs.pop('use_chat_template', None)
-    setup_kwargs.pop('chat_template', None)
-    setup_kwargs.pop('device', None)
-
-    # Load model with custom tokenizer (includes special token injection)
-    model, tokenizer = setup_model_and_tokenizer(model_name, **setup_kwargs)
-
-    # Create and return HuggingFaceModel instance with pre-loaded model/tokenizer
-    return HuggingFaceModel(
-        model_name=model_name,
-        model=model,
-        tokenizer=tokenizer,
-        **kwargs
-    )
-
-def Abyme_API_Models(model: str, **args) -> RecursiveModel:
+def Abyme_API_Model(model: str, **args) -> RecursiveModel:
     
     if model == "deepseek":
         base_model = DeepSeekModel(system_prompt=magic_prompt)

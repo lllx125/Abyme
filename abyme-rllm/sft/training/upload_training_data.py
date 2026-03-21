@@ -1,16 +1,10 @@
 import os
-import sys
+import dotenv
 from datasets import load_dataset
 from huggingface_hub import login
-import dotenv
-dotenv.load_dotenv()
-
-# Add parent directory to path to import abyme modules
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.append(parent_dir)
-
 from abyme.magic import magic_formatter
+
+dotenv.load_dotenv()
 
 # Path to the JSONL file
 DATA_PATH = "data/sft_training_data.jsonl"
