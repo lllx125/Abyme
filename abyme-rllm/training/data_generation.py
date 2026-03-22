@@ -16,7 +16,8 @@ from benchmark.math_full_benchmark import MATHFullBenchmark
 from benchmark.base import extract_boxed_answer
 from abyme.batch_runner import ParallelTreeOrchestrator
 from abyme.model import Model
-from benchmark.rate_trace import rate_all
+from training.rate_trace import rate_all
+from abyme.vllm_model import LocalVLLMModel
 
 class DataManager(MATHFullBenchmark):
     """
@@ -57,21 +58,22 @@ class DataManager(MATHFullBenchmark):
         # Store selected data
         self.train_data: List[Dict[str, Any]] = []
         self.test_data: List[Dict[str, Any]] = []
-
-        # Load full dataset
-        self._load_and_select_data()
         
         # paths
         self.train_data_path = Path(f"data/{self.iteration}.jsonl")
         self.train_output_path = Path(f"results/{self.iteration}_results.jsonl")
         self.rated_output_path = Path(f"results/{self.iteration}_rated.jsonl")
         self.test_output_path = Path(f"results/{self.iteration}_test_results.jsonl")
+        self.test_scored_output_path = Path(f"results/{self.iteration}_test_results_scored.jsonl")
         
         # Huggingface repo IDs
         self.hf_repo_raw = f"Lixing-Li/Abyme-Training-Dataset-Raw-Iteration-{self.iteration}"
         self.hf_repo_rated = f"Lixing-Li/Abyme-Training-Dataset-Rated-Iteration-{self.iteration}"
-        self.hf_repo_test = f"Lixing-Li/Abyme-Training-Dataset-Test-Iteration-{self.iteration}"
+        self.hf_repo_test_scored = f"Lixing-Li/Abyme-Training-Dataset-Test-Scored-Iteration-{self.iteration}"
         self.hf_repo_trained_model = f"Lixing-Li/Abyme-Trained-Iteration-{self.iteration}"
+        
+                # Load full dataset
+        self._load_and_select_data()
 
     def _load_and_select_data(self):
         """
@@ -100,7 +102,7 @@ class DataManager(MATHFullBenchmark):
             return
 
         # Otherwise, perform selection
-        data_path = self.train_data_path
+        data_path = Path("data/math_full.jsonl")
 
         if not data_path.exists():
             self.download()
@@ -233,8 +235,7 @@ class DataManager(MATHFullBenchmark):
 
     def generate_all(
         self,
-        model: Model,
-        max_concurrent_trees: int = 10,
+        model: LocalVLLMModel,
         **recursive_kwargs
     ):
         """
@@ -250,7 +251,7 @@ class DataManager(MATHFullBenchmark):
             hf_repo_id: HuggingFace repo ID (e.g., "username/dataset-name")
             **recursive_kwargs: Additional arguments for RecursiveModel
         """
-        output_path = self.test_output_path
+        output_path = self.train_output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'='*60}")
@@ -265,7 +266,6 @@ class DataManager(MATHFullBenchmark):
         orchestrator = ParallelTreeOrchestrator(
             base_model=model,
             output_jsonl_path=str(output_path),
-            max_concurrent_trees=max_concurrent_trees,
             **recursive_kwargs
         )
 
@@ -279,11 +279,12 @@ class DataManager(MATHFullBenchmark):
 
         # Run batch generation
         results = orchestrator.run_batch(prompts)
+        model.shutdown()
 
-        # Augment results with original problem data
+        # Augment results with original problem data, matching by result index
         augmented_results = []
-        for i, result in enumerate(results):
-            prob_idx, gen_idx = problem_indices[i]
+        for result in results:
+            prob_idx, gen_idx = problem_indices[result['index']]
             original_data = self.train_data[prob_idx]
 
             augmented = {
@@ -297,7 +298,8 @@ class DataManager(MATHFullBenchmark):
             }
             augmented_results.append(augmented)
 
-        # Re-save with augmented data
+        # Re-save with augmented data sorted by problem index
+        augmented_results.sort(key=lambda r: (r['problem_index'], r['generation_index']))
         with output_path.open('w') as f:
             for result in augmented_results:
                 f.write(json.dumps(result) + '\n')
@@ -330,8 +332,7 @@ class DataManager(MATHFullBenchmark):
 
     def test_all(
         self,
-        model: Model,
-        max_concurrent_trees: int = 10,
+        model: LocalVLLMModel,
         **recursive_kwargs
     ):
         """
@@ -358,7 +359,6 @@ class DataManager(MATHFullBenchmark):
         orchestrator = ParallelTreeOrchestrator(
             base_model=model,
             output_jsonl_path=str(output_path),
-            max_concurrent_trees=max_concurrent_trees,
             **recursive_kwargs
         )
 
@@ -367,10 +367,12 @@ class DataManager(MATHFullBenchmark):
 
         # Run batch testing
         results = orchestrator.run_batch(prompts)
+        model.shutdown()
 
-        # Augment results with original problem data
+        # Augment results with original problem data, matching by result index
         augmented_results = []
-        for i, result in enumerate(results):
+        for result in results:
+            i = result['index']
             original_data = self.test_data[i]
 
             augmented = {
@@ -383,13 +385,13 @@ class DataManager(MATHFullBenchmark):
             }
             augmented_results.append(augmented)
 
-        # Re-save with augmented data
+        # Re-save with augmented data sorted by problem index
+        augmented_results.sort(key=lambda r: r['problem_index'])
         with output_path.open('w') as f:
             for result in augmented_results:
                 f.write(json.dumps(result) + '\n')
 
         print(f"\nTesting complete! Results saved to {output_path}")
-        self._upload_to_huggingface(output_path, repo_id=self.hf_repo_test)
         
     def _upload_to_huggingface(self, file_path: Path, repo_id: str = ""):
         """
@@ -432,4 +434,83 @@ class DataManager(MATHFullBenchmark):
         """Normalize answer for comparison (inherited from parent)."""
         # Use parent class normalization from MATH500Benchmark
         return super()._normalize_answer(ans)
+    
+    def score(self, model_output: str, input: Dict[str, Any]) -> float:
+        """Score using ground_truth field from MATH full dataset."""
+        input_with_answer = {**input, 'answer': input.get('ground_truth', input.get('answer', ''))}
+        return super().score(model_output, input_with_answer)
 
+    def score_all(self):
+        """Score results/{iteration}_test_results.jsonl using inherited score function."""
+        input_path = self.test_output_path
+        output_path = self.test_scored_output_path
+
+        if not input_path.exists():
+            raise FileNotFoundError(f"Test results file does not exist: {input_path}")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with input_path.open('r') as infile:
+            lines = [line for line in infile if line.strip()]
+
+        total_score = 0.0
+        with output_path.open('w') as outfile:
+            for line in tqdm(lines, desc=f"Score: {self.iteration}_test_results"):
+                json_data = json.loads(line.strip())
+                if 'output' not in json_data:
+                    raise ValueError(f"Missing 'output' field in {input_path}")
+                s = self.score(json_data['output'], json_data)
+                total_score += s
+                outfile.write(json.dumps({**json_data, 'score': s}) + '\n')
+
+        avg = total_score / len(lines) if lines else 0.0
+        print(f"Average score: {avg:.4f} ({int(total_score)}/{len(lines)} correct)")
+        print(f"Scored results saved to {output_path} and uploaded to HuggingFace")
+        self._upload_to_huggingface(output_path, repo_id=self.hf_repo_test_scored)
+        return avg, [json.loads(l)['score'] for l in output_path.open()]
+
+    def check_scores_by_level(self) -> Tuple[float,float,float,float,float,float]:
+        """Print average score per level and total average from scored output file."""
+        if not self.test_scored_output_path.exists():
+            raise FileNotFoundError(f"Scored results file does not exist: {self.test_scored_output_path}")
+
+        level_scores: Dict[int, List[float]] = defaultdict(list)
+        all_scores: List[float] = []
+
+        with self.test_scored_output_path.open('r') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line.strip())
+                score = item['score']
+                level = item['level_num']
+                level_scores[level].append(score)
+                all_scores.append(score)
+
+        print(f"\nScores for iteration {self.iteration}:")
+        print("-" * 35)
+        result = [0,0,0,0,0]
+        for level in sorted(level_scores):
+            scores = level_scores[level]
+            avg = sum(scores) / len(scores)
+            print(f"  Level {level}: {avg:.4f} ({int(sum(scores))}/{len(scores)} correct)")
+            result[level] = avg
+        print("-" * 35)
+        total_avg = sum(all_scores) / len(all_scores) if all_scores else 0.0
+        print(f"  Total:   {total_avg:.4f} ({int(sum(all_scores))}/{len(all_scores)} correct)")
+        return total_avg, result[0], result[1], result[2], result[3], result[4]
+
+
+if __name__ == "__main__":
+    base_model = "Lixing-Li/Abyme-Qwen3.5-9B-Test-KTO"
+    iteration = 0
+    sample = (10,10,10,10,10) 
+    test = (10,10,10,10,10)
+    data_manager = DataManager(iteration=iteration, samples=sample, tests=test, num_gen_per_question=2)
+    model = LocalVLLMModel(model_path=base_model)
+    print("Model loaded successfully!")
+    data_manager.test_all(model=model, max_depth=5, max_parallel_workers=5, max_call=50, max_chain_length=5)
+    data_manager.score_all()
+    data_manager.check_scores_by_level()
+    # data_manager.generate_all(model=model, max_concurrent_trees=10, max_depth=5, max_parallel_workers=5, max_call=50, max_chain_length=5)
+    # data_manager.rate_all()

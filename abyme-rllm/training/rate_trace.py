@@ -1,83 +1,15 @@
 from pathlib import Path
-from abyme.tree_trace import TreeTraceNode, fold, length
+from abyme.tree_trace import TreeTraceNode, fold, length, dict_to_node, future_length, collect_all_nodes
 from typing import Tuple, Callable, Dict, Any, List, Optional
 from abyme.utils import verify_output_format_strict
 from abyme.magic import magic_formatter
+from collections import defaultdict
 import json
 
 GOOD = True
 BAD = False
 
-def _dict_to_node(node_dict: Dict[str, Any], parent: Optional[TreeTraceNode] = None) -> TreeTraceNode:
-    """
-    Reconstruct a TreeTraceNode from a dictionary (inverse of to_dict).
-
-    Args:
-        node_dict: Dictionary representation of a node
-        parent: Parent node reference (used during recursion)
-
-    Returns:
-        Reconstructed TreeTraceNode
-    """
-    # Reconstruct past nodes first (temporal history)
-    past_nodes = [_dict_to_node(p_dict, parent=None) for p_dict in node_dict.get("past", [])]
-
-    # Create the current node
-    node = TreeTraceNode(
-        prompt=node_dict["prompt"],
-        fragment=node_dict["fragment"],
-        parent=parent,
-        past=past_nodes,
-        index=node_dict.get("index", 0)
-    )
-
-    # Set all node properties
-    node.output = node_dict.get("output", "")
-    node.type = node_dict.get("type", "leaf")
-    node.status = node_dict.get("status", "WAIT_GEN")
-    node.difficulty = node_dict.get("difficulty", 1)
-    node.depth = node_dict.get("depth", 0)
-    node.latency = node_dict.get("latency", 0.0)
-    node.error_message = node_dict.get("error_message", "")
-    node.is_cancelled = node_dict.get("is_cancelled", False)
-
-    # Reconstruct subproblems (spatial children)
-    for sub_dict in node_dict.get("subproblems", []):
-        sub_node = _dict_to_node(sub_dict, parent=node)
-        node.subproblems.append(sub_node)
-
-    return node
-
-def compute_future_length(node: TreeTraceNode) -> float:
-    """
-    Compute the future length of a node.
-
-    future_length = length from this node to completion - length of immediate past (0 if no past)
-
-    This measures how much "new work" this node contributes to reaching the final answer.
-    Lower future_length means the node is closer to completion and more efficient.
-
-    Args:
-        node: The TreeTraceNode to compute future_length for
-
-    Returns:
-        The future_length value (can be negative if this node is shorter than its past)
-    """
-    # Length from this node to the end
-    node_to_end_length = length(node)
-
-    # Length of the immediate past (most recent past state)
-    if node.past:
-        # The last element in past is the most recent past state
-        past_length = length(node.past[-1])
-    else:
-        past_length = 0.0
-
-    future_length = node_to_end_length - past_length
-
-    return future_length
-
-def rate_all(input_path: Path, output_path: Path, score_function: Callable[[str, Dict[str, Any]], float]):
+def rate_all(input_path: Path, output_path: Path, score_function: Callable[[str, Dict[str, Any]], float], verbose: bool = True):
     """
     Rate all nodes from generated traces and output labeled training data.
 
@@ -89,183 +21,176 @@ def rate_all(input_path: Path, output_path: Path, score_function: Callable[[str,
     2. Filter nodes from traces with correct answers
     3. Sort filtered nodes by future_length
     4. Label lowest 25% (of total nodes) from correct traces as GOOD (most efficient correct nodes)
-    5. Label highest 25% (of all nodes) as BAD (least efficient nodes)
-    6. Remaining nodes are unlabeled and filtered out
+    5. Label all nodes with incorrect format as BAD
+    6. Label all final node outputs that are incorrect as BAD
+    7. Label all Failed node as BAD
+    8. Label all past (level 0) nodes as BAD if the final answer is incorrect (if exceeds 25%, randomly drop some to maintain balance)
+    9. Label the node with highest future_length of all nodes as BAD until we get 25% of total nodes
 
     Args:
         input_path: Path to JSONL file with trace results (from ParallelTreeOrchestrator)
         output_path: Path to output JSONL file with labeled nodes
         score_function: Function to score final answers (e.g., MATH500Benchmark.score)
+        verbose: If True, print label counts per category after rating.
     """
-    # Read all traces from input
-    traces_data = []
+    import random
+
+    # Nodes from traces with correct final answers
+    correct_node: Dict[int, List[TreeTraceNode]] = defaultdict(list)
+    # all nodes
+    all_node: Dict[int, List[TreeTraceNode]] = defaultdict(list)
+    
+    # good nodes
+    good_nodes: List[TreeTraceNode] = []
+    # bad nodes
+    bad_nodes: List[TreeTraceNode] = []
+
     with input_path.open('r') as f:
         for line in f:
-            if line.strip():
-                traces_data.append(json.loads(line.strip()))
+            if not line.strip():
+                continue
+            record = json.loads(line.strip())
+            if 'trace_tree' not in record:
+                continue
 
-    # Extract all nodes with their future_length and correctness info
-    all_nodes_with_metrics = []
-    correct_nodes_with_metrics = []
+            trace = dict_to_node(record['trace_tree'])
 
-    for trace_data in traces_data:
-        # Skip if no trace tree
-        trace_dict = trace_data.get('trace_tree')
-        if not trace_dict:
-            continue
+            # Score at the trace level using the pre-extracted final output.
+            # Individual nodes cannot determine answer correctness on their own.
+            try:
+                is_correct = score_function(record['output'], record) == 1.0
+            except Exception:
+                is_correct = False
 
-        # Reconstruct the trace
-        trace_node = _dict_to_node(trace_dict)
+            nodes = collect_all_nodes(trace)
+            if is_correct:
+                correct_node[record["index"]].extend(nodes)
+            all_node[record["index"]].extend(nodes)
 
-        # Check if this trace has a correct answer
-        input_data = {
-            'problem': trace_data.get('original_problem') or trace_data.get('prompt'),
-            'answer': trace_data.get('ground_truth', '')
-        }
+    total_nodes = sum(len(nodes) for nodes in all_node.values())
+    if total_nodes == 0:
+        return
 
-        is_correct = False
-        try:
-            final_output = trace_node.get_final_output()
-            answer_score = score_function(final_output, input_data)
-            is_correct = (answer_score == 1.0)
-        except Exception:
-            is_correct = False
+    target_count = total_nodes // 8  # 12.5% each for GOOD and BAD
 
-        # Extract all nodes from the trace
-        def extract_nodes(node: TreeTraceNode, past_results: List, sub_results: List) -> List[Dict[str, Any]]:
-            """Fold function to extract all nodes with their context and metrics."""
-            nodes = []
+    # Step 2-4: GOOD — all nodes from correct traces, sorted by future_length, label lowest 12.5%
+    good_per_index = target_count // len(correct_node) if correct_node else 0
+    for _ , nodes in correct_node.items():
+        nodes.sort(key=lambda n: future_length(n))
+        if len(nodes) <= good_per_index:
+            good_nodes.extend(nodes)
+        else:
+            good_nodes.extend(nodes[:good_per_index])
+    good_count = len(good_nodes)
+    
+    target_count = good_count  # To maintain balance, we want equal GOOD and BAD counts
 
-            # Collect nodes from past
-            for past_node_list in past_results:
-                nodes.extend(past_node_list)
+    # Steps 5-8: BAD — explicit bad signals
+    bad_count = 0
+    bad_format_count = 0
+    bad_final_wrong_count = 0
+    bad_failed_count = 0
+    bad_depth0_count = 0
+    bad_high_future_length_count = 0
+    
+    # GLobal pass to label explicit BAD nodes based on format, final answer correctness, and failures
+    for nodes in all_node.values():
+        for node in nodes:
+            if node in good_nodes:
+                continue  # Already labeled as GOOD
+            
+            if not node.output:
+                continue
 
-            # Only process nodes with output
-            if node.output:
-                # Get main problem (root prompt)
-                root = node
-                while root.parent is not None:
-                    root = root.parent
-                main_problem = root.prompt
+            # Bad format
+            if not verify_output_format_strict(node.output):
+                bad_nodes.append(node)
+                bad_format_count += 1
+                bad_count += 1
+                continue
 
-                # Get parent problem
-                parent_problem = node.parent.prompt if node.parent else "None"
+            # Final node with incorrect answer
+            if node.type == "FINAL" and node not in correct_node:
+                bad_nodes.append(node)
+                bad_final_wrong_count += 1
+                bad_count += 1
+                continue
 
-                # Create formatted input using magic_formatter
-                formatted_input = magic_formatter(
-                    prompt=node.prompt,
-                    main_problem=main_problem,
-                    boss_problem=parent_problem,
-                    fragment=node.fragment
-                )
+            # Failed node
+            if node.status == "FAILED":
+                bad_nodes.append(node)
+                bad_failed_count += 1
+                bad_count += 1
+                continue
+    
+    # Step 8-9: BAD — depth-0 nodes with incorrect final answer + high future_length nodes until we reach target_count
+    if bad_count < target_count:
+        bad_depth0_per_index = target_count - bad_count // len(all_node) if all_node else 0
+        for nodes in all_node.values():
+            bad_depth0_count_this_index = 0
+            for node in nodes:
+                if node in good_nodes or node in bad_nodes:
+                    continue  # Already labeled
 
-                # Compute future_length
-                future_len = compute_future_length(node)
+                if node.depth == 0 and node not in correct_node:
+                    bad_nodes.append(node)
+                    bad_depth0_count += 1
+                    bad_depth0_count_this_index += 1
+                    bad_count += 1
+                    continue
+                if bad_depth0_count_this_index >= bad_depth0_per_index:
+                    break  # Stop labeling depth-0 nodes for this index if we've reached the per-index target
+        
+    if bad_count < target_count:
+        bad_high_future_length_count_per_index = (target_count - bad_count) // len(all_node) if all_node else 0
+        for nodes in all_node.values():
+            high_future_length_nodes = [n for n in nodes if n not in good_nodes and n not in bad_nodes]
+            high_future_length_nodes.sort(key=lambda n: future_length(n), reverse=True)
+            bad_high_future_length_count_this_index = 0
+            for node in high_future_length_nodes:
+                if bad_count >= target_count:
+                    break
+                if bad_high_future_length_count_this_index >= bad_high_future_length_count_per_index:
+                    break
+                bad_nodes.append(node)
+                bad_high_future_length_count_this_index += 1
+                bad_high_future_length_count += 1
+                bad_count += 1
 
-                nodes.append({
-                    "input": formatted_input,
-                    "output": node.output,
-                    "future_length": future_len,
-                    "is_correct_trace": is_correct
-                })
+    if verbose:
+        unlabeled_count = total_nodes - good_count - bad_count
+        print(f"\n{'='*50}")
+        print(f"Rate All: {input_path.name}")
+        print(f"{'='*50}")
+        print(f"  Total nodes          : {total_nodes}")
+        print(f"  Target per class     : {target_count} (12.5%)")
+        print(f"  --- GOOD ---")
+        print(f"  Low future_length    : {good_count}")
+        print(f"  --- BAD ---")
+        print(f"  Bad format           : {bad_format_count}")
+        print(f"  Final wrong answer   : {bad_final_wrong_count}")
+        print(f"  Failed node          : {bad_failed_count}")
+        print(f"  Depth-0 incorrect    : {bad_depth0_count}")
+        print(f"  High future_length   : {bad_high_future_length_count}")
+        print(f"  BAD total            : {bad_count}")
+        print(f"  --- Unlabeled (skipped) ---")
+        print(f"  Unlabeled            : {unlabeled_count}")
+        print(f"{'='*50}\n")
 
-            # Collect nodes from subproblems
-            for sub_node_list in sub_results:
-                nodes.extend(sub_node_list)
-
-            return nodes
-
-        trace_nodes = fold(trace_node, extract_nodes)
-        all_nodes_with_metrics.extend(trace_nodes)
-
-        # Also collect nodes from correct traces separately
-        if is_correct:
-            correct_nodes_with_metrics.extend(trace_nodes)
-
-    # Sort all nodes by future_length for BAD labeling
-    all_nodes_with_metrics.sort(key=lambda x: x["future_length"])
-
-    # Sort correct nodes by future_length for GOOD labeling
-    correct_nodes_with_metrics.sort(key=lambda x: x["future_length"])
-
-    # Compute quartile counts
-    total_nodes = len(all_nodes_with_metrics)
-    quarter_count = total_nodes // 4
-
-    # Label nodes
-    labeled_nodes = []
-
-    # Label GOOD: lowest 25% future_length from correct traces
-    good_candidates = correct_nodes_with_metrics[:quarter_count]
-    for node_data in good_candidates:
-        labeled_nodes.append({
-            "input": node_data["input"],
-            "output": node_data["output"],
-            "label": GOOD
-        })
-
-    # Label BAD: highest 25% future_length from all nodes
-    bad_candidates = all_nodes_with_metrics[-quarter_count:]
-    for node_data in bad_candidates:
-        labeled_nodes.append({
-            "input": node_data["input"],
-            "output": node_data["output"],
-            "label": BAD
-        })
-
-    # Write labeled nodes to output
+    # --- Write labeled nodes to output ---
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open('w') as f:
-        for node_data in labeled_nodes:
-            f.write(json.dumps(node_data) + '\n')
-
-    print(f"Processed {total_nodes} nodes from {len(traces_data)} traces")
-    print(f"  Correct trace nodes: {len(correct_nodes_with_metrics)}")
-    print(f"  Labeled {len(labeled_nodes)} nodes")
-    print(f"  GOOD nodes (lowest 25% future_length from correct traces): {sum(1 for n in labeled_nodes if n['label'] == GOOD)}")
-    print(f"  BAD nodes (highest 25% future_length from all nodes): {sum(1 for n in labeled_nodes if n['label'] == BAD)}")
-    if total_nodes > 0:
-        print(f"  All nodes future_length range: [{all_nodes_with_metrics[0]['future_length']:.2f}, {all_nodes_with_metrics[-1]['future_length']:.2f}]")
-    if len(correct_nodes_with_metrics) > 0:
-        print(f"  Correct nodes future_length range: [{correct_nodes_with_metrics[0]['future_length']:.2f}, {correct_nodes_with_metrics[-1]['future_length']:.2f}]")
-
-def rate(trace: TreeTraceNode, score_function: Callable[[str, Dict[str, Any]], float], input_data: Dict[str, Any]) -> Tuple[bool, bool, float]:
-    """
-    Rate a tree trace by checking format correctness, answer correctness, and trace length.
-
-    Args:
-        trace: The TreeTraceNode to rate
-        score_function: Function to score the final answer (e.g., MATH500Benchmark.score)
-        input_data: The input data dictionary containing problem and ground truth answer
-
-    Returns:
-        Tuple of (all_output_formatted_correctly, answer_is_correct, trace_length)
-    """
-    # Check if all outputs along the trace are formatted correctly using fold
-    def check_format(node: TreeTraceNode, past_results: list, sub_results: list) -> bool:
-        """Check if this node and all descendants have correctly formatted output."""
-        # Check current node's output format
-        if node.output:
-            current_valid = verify_output_format_strict(node.output, print_reason=False)
-        else:
-            current_valid = True  # Empty output is considered valid
-
-        # All must be valid: current node, all past states, and all subproblems
-        return current_valid and all(past_results) and all(sub_results)
-
-    all_formatted_correctly = fold(trace, check_format)
-
-    # Get the final output and check if the answer is correct
-    try:
-        final_output = trace.get_final_output()
-        answer_score = score_function(final_output, input_data)
-        answer_correct = answer_score == 1.0
-    except Exception:
-        # If we can't get final output or scoring fails, answer is incorrect
-        answer_correct = False
-
-    # Get the trace length
-    trace_length = length(trace)
-
-    return all_formatted_correctly, answer_correct, trace_length
-    
+        for node in good_nodes:
+            record = {
+                "input": magic_formatter(node.prompt, node.main_problem, node.parent_problem, node.fragment),
+                "output": node.output,
+                "label": GOOD,
+            }
+            f.write(json.dumps(record) + '\n')
+        for node in bad_nodes:
+            record = {
+                "input": magic_formatter(node.prompt, node.main_problem, node.parent_problem, node.fragment),
+                "output": node.output,
+                "label": BAD,
+            }
+            f.write(json.dumps(record) + '\n')

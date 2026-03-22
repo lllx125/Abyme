@@ -69,3 +69,12 @@ htmlcov/
 # Environment
 .env
 .env.local
+
+# Unsloth compiled cache
+unsloth_compiled_cache/
+
+# KTO outputs (large model checkpoints)
+kto_outputs/
+
+# Broken version file
+=1.2.0

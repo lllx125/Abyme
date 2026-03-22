@@ -10,9 +10,16 @@ import time
 import uuid
 import threading
 import asyncio
+import os
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any
 from abyme.model import Model
+from abyme.magic import abyme_system_prompt
+
+
+os.environ["VLLM_TORCH_COMPILE_LEVEL"] = "0"
+os.environ["VLLM_USE_V1"] = "0"
+
 
 # ==========================================
 # 1. API MODEL (For OpenAI, DeepSeek, etc.)
@@ -28,7 +35,7 @@ class APIModel(Model):
                  model_name: str, 
                  api_key: str, 
                  base_url: Optional[str] = None, 
-                 system_prompt: str = "You are a helpful mathematical reasoning agent.",
+                 system_prompt: str = abyme_system_prompt,
                  temperature: float = 0.7,
                  max_tokens: int = 2048):
         """
@@ -79,53 +86,61 @@ class APIModel(Model):
 # 2. LOCAL vLLM MODEL (A100 Optimized)
 # ==========================================
 class LocalVLLMModel(Model):
-    """
-    A high-throughput local model utilizing vLLM's AsyncLLMEngine.
-    
-    Architecture Note:
-    Abyme uses synchronous worker threads. vLLM requires an asynchronous event loop.
-    This class acts as a Thread-to-Async Bridge. It spins up a background daemon thread
-    running an asyncio event loop. When synchronous workers call `generate()`, it safely
-    submits the request to the background loop and blocks until vLLM finishes generating.
-    This allows 50+ synchronous threads to saturate the A100 GPU efficiently.
-    """
-    
     def __init__(self, 
                  model_path: str, 
                  tensor_parallel_size: int = 1,
-                 gpu_memory_utilization: float = 0.90,
+                 gpu_memory_utilization: float = 0.9,
                  max_model_len: int = 8192,
                  temperature: float = 0.7,
                  max_tokens: int = 2048,
-                 system_prompt: str = "You are a helpful mathematical reasoning agent."):
-        """
-        Initialize the local vLLM engine.
-        Requires the `vllm` python package installed.
-        """
+                 system_prompt: str = abyme_system_prompt):
         
         try:
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.engine.async_llm_engine import AsyncLLMEngine
-            from vllm import SamplingParams
+            from transformers import AutoTokenizer
         except ImportError:
-            raise ImportError("Run `pip install vllm`.")
+            raise ImportError("Run `pip install vllm transformers`.")
 
         self.system_prompt = system_prompt
-        self.sampling_params = SamplingParams(
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        
+        # 1. Load the tokenizer
+        print("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
-        # A100 40GB OPTIMIZED DEFAULTS
+        # ---------------------------------------------------------
+        # FIX: DYNAMICALLY FIND VALID STOP TOKENS FOR ANY MODEL
+        # ---------------------------------------------------------
+        self.stop_token_ids = []
+        if self.tokenizer.eos_token_id is not None:
+            self.stop_token_ids.append(self.tokenizer.eos_token_id)
+            
+        # Common chat termination tokens across different architectures (Llama, Qwen, ChatML, Mistral)
+        potential_stop_strings = ["<|eot_id|>", "<|im_end|>", "<|end_of_turn|>", "<|endoftext|>"]
+        
+        for token_str in potential_stop_strings:
+            token_id = self.tokenizer.convert_tokens_to_ids(token_str)
+            # If the tokenizer recognizes the token, add it to our stop list
+            if token_id is not None and token_id != self.tokenizer.unk_token_id:
+                self.stop_token_ids.append(token_id)
+                
+        # Remove any duplicates
+        self.stop_token_ids = list(set(self.stop_token_ids))
+        print(f"Registered stop token IDs for this model: {self.stop_token_ids}")
+        # ---------------------------------------------------------
+
+        # 2. A100 40GB OPTIMIZED DEFAULTS
         engine_args = AsyncEngineArgs(
             model=model_path,
             tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
-            dtype="bfloat16",          # Force 16-bit
-            max_num_seqs=256,          # Maximize batch size for 50+ concurrent threads
-            enforce_eager=False,       # Use CUDA graphs for faster inference
-            disable_log_requests=True,
+            dtype="bfloat16",          
+            max_num_seqs=256,          
+            enforce_eager=True,           
+            enable_chunked_prefill=False,       
             trust_remote_code=True
         )
         
@@ -137,58 +152,75 @@ class LocalVLLMModel(Model):
         self.bridge_thread.start()
 
     def _run_async_loop(self):
-        """
-        Target function for the background daemon thread.
-        Sets up the asyncio event loop and runs it indefinitely.
-        """
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
     def generate(self, prompt: str, max_attempt: int = 1) -> str:
-        """
-        Synchronous interface called by RecursiveModel worker threads.
-        Thread-safe: Safely submits the generation task to the background async loop.
-        """
-        # Note: vLLM's standard generate doesn't take chat formats natively in the base generate method 
-        # unless using the chat templates wrapper. We will manually format the prompt for the base engine.
-        formatted_prompt = f"{self.system_prompt}\n\n{prompt}"
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": prompt}
+        ]
+        
+        formatted_prompt = self.tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
         
         last_error = None
         for _ in range(max_attempt):
             try:
-                # Submit the coroutine to the background loop
                 future = asyncio.run_coroutine_threadsafe(
                     self._async_generate(formatted_prompt), 
                     self.loop
                 )
-                
-                # Block the calling worker thread until the future resolves
                 return future.result()
-                
             except Exception as e:
                 last_error = e
                 continue
                 
         raise Exception(f"LocalVLLMModel failed after {max_attempt} attempts. Last error: {last_error}")
 
-    async def _async_generate(self, prompt: str) -> str:
-        """
-        Asynchronous generation method running inside the vLLM background loop.
-        """
-        # Generate a unique request ID for vLLM tracking
+    async def _async_generate(self, formatted_prompt: str) -> str:
+        from vllm import SamplingParams
+        
         request_id = str(uuid.uuid4())
         
-        # Submit to the continuous batching engine
+        # Inject the dynamically built stop token list
+        sampling_params = SamplingParams(
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            stop_token_ids=self.stop_token_ids
+        )
+        
+        engine_inputs = {"prompt": formatted_prompt}
+        
         results_generator = self.engine.generate(
-            prompt, 
-            self.sampling_params, 
+            engine_inputs, 
+            sampling_params, 
             request_id
         )
         
         final_output = ""
-        # Asynchronously iterate over the stream of generated tokens
         async for request_output in results_generator:
-            # We only care about the final accumulated string
             final_output = request_output.outputs[0].text
             
-        return final_output
+        return final_output.strip()
+    
+    def shutdown(self):
+        """Gracefully shuts down the background vLLM loop and engine."""
+        print("Initiating graceful vLLM shutdown...")
+        
+        # 1. Stop the background asyncio loop
+        if hasattr(self, 'loop') and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            
+        # 2. Wait for the bridge thread to finish
+        if hasattr(self, 'bridge_thread') and self.bridge_thread.is_alive():
+            self.bridge_thread.join(timeout=2.0)
+            
+        # 3. Explicitly delete the engine to trigger vLLM's internal C++ destructors
+        if hasattr(self, 'engine'):
+            del self.engine
+            
+        print("vLLM shutdown complete.")

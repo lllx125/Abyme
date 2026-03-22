@@ -36,13 +36,17 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 echo "Installing Unsloth and Hugging Face tools..."
 pip install unsloth unsloth_zoo datasets huggingface_hub
 
-# 7. Pin the EXACT library versions required for Uncontaminated Packing
-echo "Installing specific versions for uncontaminated packing..."
-pip install transformers==4.56.2
-pip install --no-deps "xformers<0.0.29" trl==0.22.2 peft accelerate bitsandbytes
+# 7. other dependencies
+pip install "transformers>=5.2.0"
+pip install --no-deps xformers trl peft accelerate bitsandbytes
+# pip install flash-attn --no-build-isolation
+# pip install "causal-conv1d>=1.2.0"
+# pip install flash-linear-attention
+pip install vllm
 
 # 8. Install the abyme package in editable mode
 echo "Installing abyme package..."
+cd abyme-rllm/
 pip install -e .
 
 echo "=========================================="
@@ -50,3 +54,6 @@ echo "Setup complete!"
 echo "To activate the environment, run:"
 echo "  source $ENV_NAME/bin/activate"
 echo "=========================================="
+
+# auto activate the environment when opening a new terminal
+echo "source $ENV_NAME/bin/activate" >> ~/.bashrc

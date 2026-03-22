@@ -5,9 +5,12 @@ import os
 import time
 import sys
 import re
+import dotenv
 import requests
 from abc import ABC, abstractmethod
 from typing import Optional, List
+
+dotenv.load_dotenv()
 
 class Notifier(ABC):
     """Abstract base class for all notifier implementations."""

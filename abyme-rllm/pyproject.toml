@@ -101,7 +101,7 @@ Repository = "https://github.com/Abyme/abyme"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["abyme*", "sft*", "benchmark*", "tests*"]
+include = ["abyme*", "sft*", "benchmark*", "tests*","training*"]
 
 [tool.setuptools.package-data]
 abyme = ["py.typed"]

@@ -215,7 +215,16 @@ class MATH500Benchmark(Benchmark):
 
 
 if __name__ == "__main__":
-    # Example usage
+    import json
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from tqdm import tqdm
+    from abyme.vllm_model import LocalVLLMModel
+
+    MODEL_PATH = "unsloth/Qwen3.5-9B"
+    TEST_NAME  = "qwen3.5-9b"
+    HF_REPO    = "Lixing-Li/MATH500-Qwen3.5-9B-SFT"
+    MAX_WORKERS = 50  # concurrent vLLM requests
+
     benchmark = MATH500Benchmark()
 
     # Download dataset if it doesn't exist
@@ -223,5 +232,53 @@ if __name__ == "__main__":
     if not data_path.exists():
         print("MATH-500 dataset not found. Downloading...")
         benchmark.download()
-    else:
-        print(f"MATH-500 dataset found at {data_path}")
+
+    # Load all problems
+    with data_path.open('r') as f:
+        problems = [json.loads(line) for line in f if line.strip()]
+    print(f"Loaded {len(problems)} problems.")
+
+    # Parallel generation
+    output_path = Path(f"results/{benchmark.name}/{TEST_NAME}.jsonl")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    model = LocalVLLMModel(model_path=MODEL_PATH)
+    print("Model loaded. Starting parallel generation...")
+
+    results = [None] * len(problems)
+
+    def _generate(idx_item):
+        idx, item = idx_item
+        output = benchmark.generate(model, item)
+        return idx, {**item, 'output': output}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_generate, (i, p)): i for i, p in enumerate(problems)}
+        for future in tqdm(as_completed(futures), total=len(problems), desc="Generating"):
+            idx, record = future.result()
+            results[idx] = record
+
+    with output_path.open('w') as f:
+        for record in results:
+            f.write(json.dumps(record) + '\n')
+    print(f"Generation complete. Saved to {output_path}")
+
+    model.shutdown()
+
+    # Score
+    benchmark.score_all(test_name=TEST_NAME)
+    avg, _ = benchmark.check_scores(test_name=TEST_NAME)
+
+    # Upload scored results to HuggingFace
+    scored_path = Path(f"results/{benchmark.name}/{TEST_NAME}_scored.jsonl")
+    try:
+        from datasets import load_dataset
+        from huggingface_hub import login
+        import os, dotenv
+        dotenv.load_dotenv()
+        login(token=os.getenv("HF_TOKEN", ""), add_to_git_credential=True)
+        dataset = load_dataset("json", data_files=str(scored_path), split="train")
+        dataset.push_to_hub(HF_REPO)
+        print(f"Uploaded to https://huggingface.co/datasets/{HF_REPO}")
+    except Exception as e:
+        print(f"HuggingFace upload failed: {e}")

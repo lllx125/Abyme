@@ -18,6 +18,8 @@ class TreeTraceNode:
         self.prompt: str = prompt
         self.fragment: str = fragment
         self.parent: Optional["TreeTraceNode"] = parent
+        self.parent_problem: str = parent.prompt if parent else "None"
+        self.main_problem: str = parent.main_problem if parent else prompt
         self.depth: int = parent.depth + 1 if parent else 0
         self.index: int = index
         self.past: List["TreeTraceNode"] = past if past is not None else []
@@ -141,6 +143,16 @@ def flatten_trace(node: TreeTraceNode) -> List[Tuple[str, str, str, str, str]]:
         
     return fold(node, agg)
 
+def collect_all_nodes(node: TreeTraceNode) -> List[TreeTraceNode]:
+    def agg(node: TreeTraceNode, past_res: List[TreeTraceNode], sub_res: List[TreeTraceNode]) -> List[TreeTraceNode]:
+        results = [node]
+        for pr in past_res:
+            results.extend(pr)
+        for sr in sub_res:
+            results.extend(sr)
+        return results
+    return fold(node, agg)
+
 
 def parallel_latency(node: TreeTraceNode) -> float:
     """Calculates the minimum execution latency assuming infinite concurrent workers."""
@@ -162,10 +174,10 @@ def parallel_latency(node: TreeTraceNode) -> float:
         
     return fold(node, agg)
 
-def length(node: TreeTraceNode) -> float:
+def length(node: TreeTraceNode) -> int:
     """Calculates the minimum execution latency assuming infinite concurrent workers."""
     def agg(n: TreeTraceNode, p_res: List[int], s_res: List[int]) -> int:
-        node_L = sum(p_res) + len(n.output)
+        node_L = p_res[-1] + len(n.output) if p_res else len(n.output)
         if not s_res:
             sub_L = 0
         elif n.type == AND:
@@ -235,6 +247,8 @@ def to_dict(node: TreeTraceNode) -> dict:
         return {
             "prompt": n.prompt,
             "fragment": n.fragment,
+            "main_problem": n.main_problem,
+            "parent_problem": n.parent_problem,
             "output": n.output,
             "type": n.type,
             "status": n.status,
@@ -249,6 +263,76 @@ def to_dict(node: TreeTraceNode) -> dict:
         }
     
     return fold(node, agg)
+
+def dict_to_node(node_dict: Dict[str, Any], parent: Optional[TreeTraceNode] = None) -> TreeTraceNode:
+    """
+    Reconstruct a TreeTraceNode from a dictionary (inverse of to_dict).
+
+    Args:
+        node_dict: Dictionary representation of a node
+        parent: Parent node reference (used during recursion)
+
+    Returns:
+        Reconstructed TreeTraceNode
+    """
+    # Reconstruct past nodes first (temporal history)
+    past_nodes = [dict_to_node(p_dict, parent=None) for p_dict in node_dict.get("past", [])]
+
+    # Create the current node
+    node = TreeTraceNode(
+        prompt=node_dict["prompt"],
+        fragment=node_dict["fragment"],
+        parent=parent,
+        past=past_nodes,
+        index=node_dict.get("index", 0)
+    )
+
+    # Set all node properties
+    node.output = node_dict.get("output", "")
+    node.type = node_dict.get("type", "leaf")
+    node.status = node_dict.get("status", "WAIT_GEN")
+    node.difficulty = node_dict.get("difficulty", 1)
+    node.depth = node_dict.get("depth", 0)
+    node.latency = node_dict.get("latency", 0.0)
+    node.error_message = node_dict.get("error_message", "")
+    node.is_cancelled = node_dict.get("is_cancelled", False)
+    node.parent_problem = node_dict.get("parent_problem", "None")
+    node.main_problem = node_dict.get("main_problem", node.prompt)
+
+    # Reconstruct subproblems (spatial children)
+    for sub_dict in node_dict.get("subproblems", []):
+        sub_node = dict_to_node(sub_dict, parent=node)
+        node.subproblems.append(sub_node)
+
+    return node
+
+from typing import List
+
+def future_length(node: TreeTraceNode) -> int:
+    """ 
+    Calculates the expected length from the current node to the end of its chain.
+    future_length = current length + continuation length + subtree length
+                  = end of the chain length - length of immediate past
+    """
+    
+    # 1. Find the "end of the chain" node
+    # Since continue_generation updates the parent's array in-place, 
+    # it always points to the latest temporal version of this node!
+    if node.parent is not None:
+        end_node = node.parent.subproblems[node.index]
+    else:
+        # If it has no parent, it's the absolute root. 
+        # (Assuming the user passes the latest root if tracking the whole tree).
+        end_node = node
+        
+    # 2. Get the total length of the final chain
+    end_of_chain_length = length(end_node)
+    
+    # 3. Determine the "immediate past" nodes
+    length_of_immediate_past = length(node.past[-1]) if node.past else 0.0
+    
+    # 5. Apply the formula
+    return end_of_chain_length - length_of_immediate_past
 
 def draw_tree(
     node: TreeTraceNode, 

@@ -17,13 +17,13 @@ from abyme.tree_trace import (
     total_calls, max_depth, max_subproblems, to_dict,
     max_output_character, parallel_latency
 )
-from abyme.vllm_models import LocalVLLMModel, APIModel, Model
+from abyme.vllm_model import LocalVLLMModel, APIModel, Model
 
 class ParallelTreeOrchestrator:
     def __init__(self, 
-                 base_model: Model, 
+                 base_model: LocalVLLMModel, 
                  output_jsonl_path: str = "results/results.jsonl",
-                 max_concurrent_trees: int = 10,  # 10 trees * 5 workers/tree = 50 concurrent vLLM requests
+                 max_concurrent_trees: int = 20,  # 10 trees * 5 workers/tree = 50 concurrent vLLM requests
                  **recursive_kwargs):
         """
         Initialize the Batch Runner.
@@ -44,7 +44,7 @@ class ParallelTreeOrchestrator:
 
         # Set default RecursiveModel args optimal for A100 if not provided
         if 'max_parallel_workers' not in self.recursive_kwargs:
-            self.recursive_kwargs['max_parallel_workers'] = 5
+            self.recursive_kwargs['max_parallel_workers'] = 3
         if 'print_progress' not in self.recursive_kwargs:
             self.recursive_kwargs['print_progress'] = False
 
@@ -150,17 +150,14 @@ if __name__ == "__main__":
     
     # 1. Initialize the shared vLLM Model (Optimized for 8B on 40GB A100)
     base_model = LocalVLLMModel(
-        model_path="meta-llama/Meta-Llama-3-8B-Instruct", # Replace with your local HF model path
+        model_path="Lixing-Li/Abyme-Qwen3.5-9B-SFT",
         tensor_parallel_size=1
     )
     
-    # Optional guard model (can just use the same base_model if you want to save memory)
-    guard_model = base_model 
 
     # 2. Initialize the Orchestrator
     orchestrator = ParallelTreeOrchestrator(
         base_model=base_model,
-        guard_model=guard_model,
         output_jsonl_path="./a100_run_results.jsonl",
         
         # --- Batch Tuning ---
@@ -168,22 +165,24 @@ if __name__ == "__main__":
         
         # --- **kwargs passed directly to RecursiveModel ---
         max_parallel_workers=5,   # Subproblem workers per tree
-        max_depth=15,
-        max_call=100,
+        max_depth=1,
+        max_call=10,
         max_chain_length=5,
         proceed_when_fail=True,
-        print_progress=False      # Keep False to avoid terminal spam during batching
+        print_progress=True      # Keep False to avoid terminal spam during batching
     )
 
     # 3. Load your prompts
     test_prompts = [
-        "Prove that sqrt(2) is irrational.",
-        "Differentiate f(x) = x^x.",
-        "Explain the twin paradox in special relativity.",
-        "Write a python script to implement a red-black tree.",
-        "Solve the system of equations: 2x + 3y = 12, 5x - y = 7."
+        "what is 1+1?",
+        "what is 2+2?",
+        "what is 3+3?",
+        "what is 4+4?",
+        "what is 5+5?"
         # ... load thousands more from a dataset
     ]
 
     # 4. Fire the batch
     results = orchestrator.run_batch(test_prompts)
+
+    base_model.shutdown()
