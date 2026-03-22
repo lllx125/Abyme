@@ -71,6 +71,7 @@ class DataManager(MATHFullBenchmark):
         self.hf_repo_raw = f"Lixing-Li/Abyme-Training-Dataset-Raw-Iteration-{self.iteration}"
         self.hf_repo_rated = f"Lixing-Li/Abyme-Training-Dataset-Rated-Iteration-{self.iteration}"
         self.hf_repo_test = f"Lixing-Li/Abyme-Training-Dataset-Test-Iteration-{self.iteration}"
+        self.hf_repo_trained_model = f"Lixing-Li/Abyme-Trained-Iteration-{self.iteration}"
 
     def _load_and_select_data(self):
         """
