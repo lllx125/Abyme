@@ -5,79 +5,93 @@ This module orchestrates the complete iterative training loop:
 Generation -> Rating -> KTO Training -> Testing -> Scoring -> Level Upgrade
 """
 
+import multiprocessing
 from typing import Tuple
 
 from training.data_generation import DataManager
-from training.run_training import run_training
-from abyme.vllm_model import LocalVLLMModel
 from training.notifier import mailman
-from benchmark.math100_benchmark import MATH100Benchmark
-from pathlib import Path
 
-NUM_QUESTIONS = 100
 NUM_GEN_PER_QUESTION = 10
+TEST_SAMPLES = (20, 20, 20, 20, 20)
 
-BASE_LINE_SCORE = [0.883,0.878,0.851,0.766,0.574]
+BASE_LINE_SCORE = [0.883,0.878,0.851,0.766,0.574] # from Qwen3.5-9B on MATH-500 benchmark, by level
 LEVELS = [
-    (0.2,0.2,0.2,0.2,0.2),
-    (1.0,0.0,0.0,0.0,0.0),  
-    (0.2,0.8,0.0,0.0,0.0),
-    (0.1,0.2,0.7,0.0,0.0),
-    (0.1,0.1,0.2,0.6,0.0),
-    (0.1,0.1,0.1,0.2,0.5),
+    (20, 20, 20, 20, 20), # Level 0
+    (80, 5, 5, 5, 5),     # Level 1
+    (20, 65, 5, 5, 5),    # Level 2
+    (5, 20, 65, 5, 5),    # Level 3
+    (5, 5, 20, 65, 5),    # Level 4
+    (5, 5, 5, 20, 65)     # Level 5
 ]
 
+BASE_MODEL = "Lixing-Li/Abyme-Qwen3.5-9B-SFT"
 
-def run_single_interation(base_model:str, iteration:int, sample:Tuple[float,float,float,float,float], **recursive_kwargs) -> Tuple[str, float, float, float, float, float, float]:
-    # Generate the dataset
-    if not sum(sample) == 1:
-        raise ValueError("Sample frequencies must sum to 1.")
-    training_sample = (int(sample[0]*NUM_QUESTIONS), int(sample[1]*NUM_QUESTIONS), int(sample[2]*NUM_QUESTIONS), int(sample[3]*NUM_QUESTIONS), int(sample[4]*NUM_QUESTIONS))
-    test_samples = training_sample
+
+def _generate(dm, base_model_path, recursive_kwargs):
+    from abyme.vllm_model import LocalVLLMModel
+    model = LocalVLLMModel(model_path=base_model_path)
+    dm.generate_all(model, **recursive_kwargs)
+
+
+def _train(model_name, dataset_id, hub_repo_id):
+    from training.run_training import run_training
+    run_training(model_name=model_name, dataset_id=dataset_id, hub_repo_id=hub_repo_id)
+
+
+def _test(dm, trained_model_path, recursive_kwargs):
+    from abyme.vllm_model import LocalVLLMModel
+    trained_model = LocalVLLMModel(model_path=trained_model_path)
+    dm.test_all(trained_model, **recursive_kwargs)
+
+
+def _spawn(target, args):
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=target, args=args)
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        raise RuntimeError(f"Subprocess {target.__name__} failed with exit code {p.exitcode}")
+
+
+def run_single_interation(base_model:str, iteration:int, sample:Tuple[int, int, int, int, int], **recursive_kwargs) -> Tuple[str, float, float, float, float, float, float]:
+    training_sample = sample
+    test_samples = TEST_SAMPLES
     mailman.send(f"Training Loop Started: Iteration {iteration} has started with sample distribution: {sample}")
-    
-    # define base model
-    model = LocalVLLMModel(model_path=base_model)
-    mailman.send(f"Model {base_model} loaded successfully!")
-    
-    # define the dataset manager
-    data_manager = DataManager(iteration=iteration, samples=training_sample, tests = test_samples, num_gen_per_question=NUM_GEN_PER_QUESTION)
-    
-    # run the model on the questions
-    data_manager.generate_all(model,**recursive_kwargs)
-    # create the dataset for training by rating the generated data
-    
-    data_manager.rate_all()
+
+    dm = DataManager(iteration=iteration, samples=training_sample, tests=test_samples, num_gen_per_question=NUM_GEN_PER_QUESTION)
+
+    # generation subprocess — GPU memory fully freed on exit
+    _spawn(_generate, (dm, base_model, recursive_kwargs))
+    mailman.send(f"Model {base_model} generation completed!")
+
+    dm.rate_all()
     mailman.send(f"Data generation and rating completed for iteration {iteration}. Starting KTO training.")
-    
-    # run the KTO training
-    run_training(model_name=base_model, dataset_id=data_manager.hf_repo_rated, hub_repo_id=data_manager.hf_repo_trained_model)
+
+    # training subprocess — GPU memory fully freed on exit
+    _spawn(_train, (base_model, dm.hf_repo_rated, dm.hf_repo_trained_model))
     mailman.send(f"KTO Training completed for iteration {iteration}. Starting testing and scoring.")
-    
-    # test the trained model and score the results
-    trained_model = LocalVLLMModel(model_path=data_manager.hf_repo_trained_model)
-    
-    # benchmark against MATH-100
-    math100 = MATH100Benchmark()
-    math100.generate_all(trained_model, test_name=f"iteration_{iteration}", **recursive_kwargs)
-    math100.score_all(test_name=f"iteration_{iteration}")
-    results = math100.check_scores_by_level(test_name=f"iteration_{iteration}")
-    math100.append_score_to_hub(scores=results, test_name=f"iteration_{iteration}")
-    mailman.send(f"Iteration {iteration} completed. Average Scores: {results[0]}.")
-    return (data_manager.hf_repo_trained_model, *results)
+
+    # inference subprocess — GPU memory fully freed on exit
+    _spawn(_test, (dm, dm.hf_repo_trained_model, recursive_kwargs))
+
+    dm.score_all()
+    results = dm.check_scores_by_level()
+    mailman.send(f"Iteration {iteration} completed. Average: {results[0]:.4f} | L1: {results[1]:.4f} L2: {results[2]:.4f} L3: {results[3]:.4f} L4: {results[4]:.4f} L5: {results[5]:.4f}.")
+    return (dm.hf_repo_trained_model, *results)
+
 
 def run_training_loop(start_model: str, start_iteration: int, start_level: int, max_iterations_per_level: int = 5):
     """
     Run the training until the model at each level reaches the baseline score or we hit the max iterations per level.
-    """ 
+    """
     current_model = start_model
     next_iteration = start_iteration + 1
     level = start_level
     iterations_this_level = 0
-    while level < len(LEVELS) and iterations_this_level < max_iterations_per_level:
+    while level <= 5 and iterations_this_level < max_iterations_per_level:
         mailman.send(f"Starting iteration {next_iteration} at level {level} with model {current_model}")
         next_model, scores = run_single_interation(base_model=current_model, iteration=next_iteration, sample=LEVELS[level], **recursive_kwargs)
-        if scores[level] >= BASE_LINE_SCORE[level]:  
+        if scores[level] >= BASE_LINE_SCORE[level]:
             mailman.send(f"Level {level} passed with score {scores[level]:.4f}! Moving to next level.")
             level += 1
             iterations_this_level = 0
@@ -86,19 +100,36 @@ def run_training_loop(start_model: str, start_iteration: int, start_level: int, 
             iterations_this_level += 1
         current_model = next_model
         next_iteration += 1
-    
+
     mailman.send(f"Training loop completed. Final model: {current_model}, final level: {level}")
 
+def score_base_model(base_model:str, recursive_kwargs):
+    dm = DataManager(iteration=0, samples=(20,20,20,20,20), tests=(20,20,20,20,20), num_gen_per_question=NUM_GEN_PER_QUESTION)
+    _spawn(_test, (dm, base_model, recursive_kwargs))
+    dm.score_all()
+    results = dm.check_scores_by_level()
+
+def clean_score_from_hub(repo_id: str = "Lixing-Li/Model-Scores", filter_test_name: str = "SFT-base"):
+    """Delete all records except for SFT-base"""
+    from datasets import load_dataset
+
+    try:
+        ds = load_dataset(repo_id, split="train")
+        filtered = ds.filter(lambda x: x["test_name"] == filter_test_name)
+        filtered.push_to_hub(repo_id, private=True)
+        print(f"Cleaned dataset, only {filter_test_name} records remain.")
+    except Exception as e:
+        print(f"Failed to clean dataset: {e}")
+
 if __name__ == "__main__":
-    base_model = "Lixing-Li/Abyme-Qwen3.5-9B-SFT"
+    #base_model = "Lixing-Li/Abyme-Trained-Iteration-1"
+    base_model = BASE_MODEL
     recursive_kwargs = {
         "max_depth": 5,
-        "max_call": 50,
+        "max_call": 70,
         "max_chain_length": 5
     }
-    run_single_interation(base_model=base_model, iteration=1, sample=(1.0,0.0,0.0,0.0,0.0), **recursive_kwargs)
-    #run_training_loop(start_model=base_model, start_iteration=1, start_level=1, max_iterations_per_level=5)
-    
-    
-    
-    
+    #clean_score_from_hub()
+    #score_base_model(base_model=base_model, recursive_kwargs=recursive_kwargs)
+    #run_single_interation(base_model=base_model, iteration=2, sample=(1.0,0.0,0.0,0.0,0.0), **recursive_kwargs)
+    run_training_loop(start_model=base_model, start_iteration=0, start_level=1, max_iterations_per_level=5)

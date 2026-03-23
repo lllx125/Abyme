@@ -4,6 +4,7 @@ from trl import KTOConfig, KTOTrainer
 from unsloth import FastLanguageModel, PatchDPOTrainer, is_bfloat16_supported
 import os
 import dotenv
+from abyme.magic import abyme_system_prompt
 
 dotenv.load_dotenv()
 
@@ -19,8 +20,9 @@ LORA_RANK = 64
 LORA_ALPHA = 128
 BATCH_SIZE = 2
 GRADIENT_ACCUMULATION_STEPS = 8
-LEARNING_RATE = 5e-6
+LEARNING_RATE = 2e-6
 NUM_EPOCHS = 1
+BETA = 0.2
 
 def run_training(model_name, dataset_id, hub_repo_id):
     HF_TOKEN = os.getenv("HF_TOKEN", "")                      # HuggingFace Write Token
@@ -60,7 +62,10 @@ def run_training(model_name, dataset_id, hub_repo_id):
     # TRL's KTOTrainer expects 'prompt', 'completion', and a boolean 'label'
     def format_kto_dataset(example):
             # Format input as a user prompt
-            prompt_msg = [{"role": "user", "content": example["input"]}]
+            prompt_msg = [
+            {"role": "system", "content": abyme_system_prompt},
+            {"role": "user", "content": example["input"]}
+            ]
             # Format output as the assistant completion
             completion_msg = [{"role": "assistant", "content": example["output"]}]
             
@@ -97,7 +102,7 @@ def run_training(model_name, dataset_id, hub_repo_id):
         lr_scheduler_type="linear",
         seed=3407,
         output_dir="kto_outputs",
-        beta=0.1,                        # KTO implicit reward margin hyperparameter
+        beta=BETA,                        # KTO implicit reward margin hyperparameter
         remove_unused_columns=False,
     )
     
@@ -135,6 +140,13 @@ def run_training(model_name, dataset_id, hub_repo_id):
     clean_tokenizer.push_to_hub(hub_repo_id, token=HF_TOKEN)
 
     print(f"Success! Model uploaded to: https://huggingface.co/{hub_repo_id}")
+
+    # Free GPU memory so subsequent vLLM inference engines can initialize
+    import gc
+    del trainer, model, tokenizer, clean_tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     
 if __name__ == "__main__":
     base_model = "Lixing-Li/Abyme-Qwen3.5-9B-SFT"

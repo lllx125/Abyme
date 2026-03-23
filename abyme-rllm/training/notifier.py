@@ -30,8 +30,6 @@ class DiscordNotifier(Notifier):
     ):
         if url is None:
             url = os.getenv("DISCORD_URL")
-            if url is None:
-                raise ValueError("Discord webhook URL must be provided.")
 
         self.url = url
         self.identity = identity
@@ -47,7 +45,12 @@ class DiscordNotifier(Notifier):
                 return
 
         formatted_message = self._format_message(message)
-        
+
+        if self.url is None:
+            print(formatted_message)
+            self._last_send_time = current_time
+            return
+
         try:
             requests.post(self.url, json={"content": formatted_message})
             self._last_send_time = current_time
@@ -133,3 +136,4 @@ class StderrToNotifier:
 
     def flush(self):
         sys.__stderr__.flush()
+        

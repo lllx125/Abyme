@@ -148,22 +148,23 @@ class MATH500Benchmark(Benchmark):
         combined.push_to_hub(repo_id)
         print(f"Score record pushed to https://huggingface.co/datasets/{repo_id}")
 
-    def check_scores_by_level(
+
+    def _check_scores_from_path(
         self,
-        test_name: str,
+        scored_path: Path,
+        label: str,
         level_field: str = "level",
     ) -> Tuple[float, float, float, float, float, float]:
-        """Print average score per level and total average from scored output file.
+        """Compute and print per-level scores from a scored JSONL file.
 
         Args:
-            test_name: Display label (e.g. test_name or iteration number).
-            level_field: Name of the field in each record that holds the level (1-5).
+            scored_path: Path to the scored JSONL file.
+            label: Display label for the printout.
+            level_field: Field name holding the level (1-5) in each record.
 
         Returns:
             (total_avg, level1_avg, level2_avg, level3_avg, level4_avg, level5_avg)
         """
-        scored_path = Path(f"results/{self.name}/{test_name}_scored.jsonl")
-
         level_scores: Dict[int, List[float]] = defaultdict(list)
         all_scores: List[float] = []
 
@@ -172,12 +173,10 @@ class MATH500Benchmark(Benchmark):
                 if not line.strip():
                     continue
                 item = json.loads(line.strip())
-                score = item['score']
-                level = item[level_field]
-                level_scores[level].append(score)
-                all_scores.append(score)
+                level_scores[item[level_field]].append(item['score'])
+                all_scores.append(item['score'])
 
-        print(f"\nScores for {test_name}:")
+        print(f"\nScores for {label}:")
         print("-" * 35)
         result = []
         for level in sorted(level_scores):
@@ -189,6 +188,23 @@ class MATH500Benchmark(Benchmark):
         total_avg = sum(all_scores) / len(all_scores) if all_scores else 0.0
         print(f"  Total:   {total_avg:.4f} ({int(sum(all_scores))}/{len(all_scores)} correct)")
         return total_avg, result[0], result[1], result[2], result[3], result[4]
+
+    def check_scores_by_level(
+        self,
+        test_name: str,
+        level_field: str = "level",
+    ) -> Tuple[float, float, float, float, float, float]:
+        """Print average score per level and total average from scored output file.
+
+        Args:
+            test_name: Name of the test run (used for path and display label).
+            level_field: Name of the field in each record that holds the level (1-5).
+
+        Returns:
+            (total_avg, level1_avg, level2_avg, level3_avg, level4_avg, level5_avg)
+        """
+        scored_path = Path(f"results/{self.name}/{test_name}_scored.jsonl")
+        return self._check_scores_from_path(scored_path, test_name, level_field)
 
     def _normalize_answer(self, ans: str) -> str:
         """

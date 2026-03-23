@@ -10,15 +10,18 @@ echo "=========================================="
 echo "Checking GPU availability..."
 nvidia-smi
 
-# 1. Install standard system dependencies for virtual environments
+# 1. Install Python 3.12 and system dependencies
 echo "Installing system dependencies..."
 sudo apt-get update -y
-sudo apt-get install python3-venv python3-pip tmux -y
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt-get update -y
+sudo apt-get install -y python3.12 python3.12-venv python3.12-dev python3-pip tmux
 
 # 2. Create the Virtual Environment
 ENV_NAME="venv"
 echo "Creating virtual environment: $ENV_NAME"
-python3 -m venv $ENV_NAME
+python3.12 -m venv $ENV_NAME
 
 # 3. Activate the environment
 echo "Activating virtual environment..."

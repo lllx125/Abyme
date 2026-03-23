@@ -210,17 +210,26 @@ class LocalVLLMModel(Model):
     def shutdown(self):
         """Gracefully shuts down the background vLLM loop and engine."""
         print("Initiating graceful vLLM shutdown...")
-        
-        # 1. Stop the background asyncio loop
+
+        # 1. Shut down the engine while the loop is still running so vLLM can
+        #    cancel its internal async tasks via call_soon_threadsafe.
+        if hasattr(self, 'engine'):
+            self.engine.shutdown()
+
+        # 2. Let the loop process the task cancellations before we stop it.
+        if hasattr(self, 'loop') and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(asyncio.sleep(0.1), self.loop).result(timeout=5.0)
+
+        # 3. Stop the background asyncio loop.
         if hasattr(self, 'loop') and self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)
-            
-        # 2. Wait for the bridge thread to finish
+
+        # 4. Wait for the bridge thread to finish.
         if hasattr(self, 'bridge_thread') and self.bridge_thread.is_alive():
-            self.bridge_thread.join(timeout=2.0)
-            
-        # 3. Explicitly delete the engine to trigger vLLM's internal C++ destructors
+            self.bridge_thread.join(timeout=5.0)
+
+        # 5. Delete the engine now that all async tasks are cleanly cancelled.
         if hasattr(self, 'engine'):
             del self.engine
-            
+
         print("vLLM shutdown complete.")
