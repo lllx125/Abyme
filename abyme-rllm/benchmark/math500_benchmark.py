@@ -105,7 +105,6 @@ class MATH500Benchmark(Benchmark):
     def append_score_to_hub(
         self,
         scores: Tuple[float, float, float, float, float, float],
-        model_path: str,
         test_name: str,
         repo_id: str = "Lixing-Li/Model-Scores",
     ):
@@ -116,7 +115,6 @@ class MATH500Benchmark(Benchmark):
 
         Args:
             scores: (total_avg, level1, level2, level3, level4, level5)
-            model_path: Model identifier (stored as metadata).
             test_name: Test run name (stored as metadata).
             repo_id: HuggingFace dataset repo to push to.
         """
@@ -130,7 +128,6 @@ class MATH500Benchmark(Benchmark):
 
         total, l1, l2, l3, l4, l5 = scores
         new_record = {
-            "model": model_path,
             "test_name": test_name,
             "total": total,
             "level_1": l1,
@@ -153,22 +150,19 @@ class MATH500Benchmark(Benchmark):
 
     def check_scores_by_level(
         self,
-        scored_path: Path,
-        label: str,
+        test_name: str,
         level_field: str = "level",
     ) -> Tuple[float, float, float, float, float, float]:
         """Print average score per level and total average from scored output file.
 
         Args:
-            scored_path: Path to the scored JSONL file.
-            label: Display label (e.g. test_name or iteration number).
+            test_name: Display label (e.g. test_name or iteration number).
             level_field: Name of the field in each record that holds the level (1-5).
 
         Returns:
             (total_avg, level1_avg, level2_avg, level3_avg, level4_avg, level5_avg)
         """
-        if not scored_path.exists():
-            raise FileNotFoundError(f"Scored results file does not exist: {scored_path}")
+        scored_path = Path(f"results/{self.name}/{test_name}_scored.jsonl")
 
         level_scores: Dict[int, List[float]] = defaultdict(list)
         all_scores: List[float] = []
@@ -183,7 +177,7 @@ class MATH500Benchmark(Benchmark):
                 level_scores[level].append(score)
                 all_scores.append(score)
 
-        print(f"\nScores for {label}:")
+        print(f"\nScores for {test_name}:")
         print("-" * 35)
         result = []
         for level in sorted(level_scores):

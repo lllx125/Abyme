@@ -12,15 +12,16 @@ from typing import Dict, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from abyme.model import Model
+from abyme.batch_runner import ParallelTreeOrchestrator
+from abyme.vllm_model import LocalVLLMModel
 from benchmark.math500_benchmark import MATH500Benchmark
 
 
 class MATH100Benchmark(MATH500Benchmark):
     """
     MATH-100: 20 randomly sampled questions per difficulty level (5 levels = 100 total).
-    Overrides generate_all and score_all with parallel ThreadPoolExecutor for vLLM throughput.
-    Inherits score() from MATH500Benchmark.
+    Overrides generate_all with ParallelTreeOrchestrator for vLLM throughput,
+    and score_all with parallel ThreadPoolExecutor. Inherits score() from MATH500Benchmark.
     """
 
     @property
@@ -68,14 +69,15 @@ class MATH100Benchmark(MATH500Benchmark):
 
         print(f"MATH-100 saved to {output_path} ({len(selected)} problems)")
 
-    def generate_all(self, model: Model, test_name: str, max_workers: int = 50):
+    def generate_all(self, model: LocalVLLMModel, test_name: str, **recursive_kwargs):
         """
-        Parallel generation using ThreadPoolExecutor to saturate the vLLM async engine.
+        Parallel generation using ParallelTreeOrchestrator to saturate the vLLM async engine.
 
         Args:
-            model: An instance of a Model (typically LocalVLLMModel)
+            model: An instance of LocalVLLMModel
             test_name: Name for this run (used for output file naming)
-            max_workers: Number of concurrent threads hitting the vLLM engine
+            **recursive_kwargs: Arguments passed to ParallelTreeOrchestrator / RecursiveModel
+                                 (e.g., max_concurrent_trees, max_depth, max_parallel_workers)
         """
         input_path = Path(f"data/{self.name}.jsonl")
         output_path = Path(f"results/{self.name}/{test_name}.jsonl")
@@ -88,21 +90,26 @@ class MATH100Benchmark(MATH500Benchmark):
         with input_path.open("r") as f:
             problems = [json.loads(line) for line in f if line.strip()]
 
-        results: list = [None] * len(problems)
+        orchestrator = ParallelTreeOrchestrator(
+            base_model=model,
+            output_jsonl_path=str(output_path),
+            **recursive_kwargs
+        )
 
-        def _generate(idx_item):
-            idx, item = idx_item
-            output = self.generate(model, item)
-            return idx, {**item, "output": output}
+        prompts = [item["problem"] for item in problems]
+        results = orchestrator.run_batch(prompts)
+        model.shutdown()
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_generate, (i, p)): i for i, p in enumerate(problems)}
-            for future in tqdm(as_completed(futures), total=len(problems), desc=f"Generate: {test_name}"):
-                idx, record = future.result()
-                results[idx] = record
+        # Augment results with original problem metadata
+        augmented = []
+        for result in results:
+            idx = result["index"]
+            augmented.append({**problems[idx], **result})
+
+        augmented.sort(key=lambda r: r["index"])
 
         with output_path.open("w") as f:
-            for record in results:
+            for record in augmented:
                 f.write(json.dumps(record) + "\n")
 
         print(f"Generation complete. Saved to {output_path}")
@@ -150,11 +157,8 @@ class MATH100Benchmark(MATH500Benchmark):
 
 
 if __name__ == "__main__":
-    from abyme.vllm_model import LocalVLLMModel
-
-    MODEL_PATH = "Lixing_Li/Abyme-Qwen3.5-9B-SFT"
-    TEST_NAME = "qwen3.5-9b"
-    MAX_WORKERS = 50
+    MODEL_PATH = "Lixing-Li/Abyme-Qwen3.5-9B-SFT"
+    TEST_NAME = "SFT-base"
 
     benchmark = MATH100Benchmark()
 
@@ -166,12 +170,19 @@ if __name__ == "__main__":
     model = LocalVLLMModel(model_path=MODEL_PATH)
     print("Model loaded. Starting parallel generation...")
 
-    benchmark.generate_all(model, test_name=TEST_NAME, max_workers=MAX_WORKERS)
-    model.shutdown()
+    benchmark.generate_all(
+        model,
+        test_name=TEST_NAME,
+        max_concurrent_trees=20,
+        max_depth=5,
+        max_parallel_workers=5,
+        max_call=50,
+        max_chain_length=5,
+    )
 
-    benchmark.score_all(test_name=TEST_NAME, max_workers=MAX_WORKERS)
+    benchmark.score_all(test_name=TEST_NAME)
     benchmark.check_scores(test_name=TEST_NAME)
     scores = benchmark.check_scores_by_level(
         Path(f"results/{benchmark.name}/{TEST_NAME}_scored.jsonl"), TEST_NAME
     )
-    benchmark.append_score_to_hub(scores, MODEL_PATH, TEST_NAME)
+    benchmark.append_score_to_hub(scores, TEST_NAME)

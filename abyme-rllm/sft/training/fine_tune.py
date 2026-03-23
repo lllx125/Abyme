@@ -119,3 +119,9 @@ model.push_to_hub_merged(
     save_method="merged_16bit",
     token=HF_TOKEN
 )
+
+# Re-push tokenizer with clean transformers AutoTokenizer to strip unsloth's
+# TokenizersBackend class name from tokenizer_config.json
+from transformers import AutoTokenizer
+clean_tokenizer = AutoTokenizer.from_pretrained(MODEL_HUB_NAME, token=HF_TOKEN)
+clean_tokenizer.push_to_hub(MODEL_HUB_NAME, token=HF_TOKEN)

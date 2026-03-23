@@ -37,23 +37,19 @@ echo "Installing Unsloth and Hugging Face tools..."
 pip install unsloth unsloth_zoo datasets huggingface_hub
 
 # 7. other dependencies
-pip install "transformers>=5.2.0"
 pip install --no-deps xformers trl peft accelerate bitsandbytes
-# pip install flash-attn --no-build-isolation
-# pip install "causal-conv1d>=1.2.0"
-# pip install flash-linear-attention
+pip install flash-attn --no-build-isolation
 pip install vllm
+pip install --upgrade transformers  # must come after vllm to override its pinned version
 
 # 8. Install the abyme package in editable mode
 echo "Installing abyme package..."
 cd abyme-rllm/
 pip install -e .
 
-echo "=========================================="
-echo "Setup complete!"
-echo "To activate the environment, run:"
-echo "  source $ENV_NAME/bin/activate"
-echo "=========================================="
-
 # auto activate the environment when opening a new terminal
 echo "source $ENV_NAME/bin/activate" >> ~/.bashrc
+
+# 9 Install looong dependencies
+pip install "causal-conv1d>=1.2.0"
+pip install flash-linear-attention

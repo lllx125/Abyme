@@ -127,6 +127,13 @@ def run_training(model_name, dataset_id, hub_repo_id):
         save_method="merged_16bit",
         token=HF_TOKEN,
     )
+
+    # Re-push tokenizer with clean transformers AutoTokenizer to strip unsloth's
+    # TokenizersBackend class name from tokenizer_config.json
+    from transformers import AutoTokenizer
+    clean_tokenizer = AutoTokenizer.from_pretrained(hub_repo_id, token=HF_TOKEN)
+    clean_tokenizer.push_to_hub(hub_repo_id, token=HF_TOKEN)
+
     print(f"Success! Model uploaded to: https://huggingface.co/{hub_repo_id}")
     
 if __name__ == "__main__":

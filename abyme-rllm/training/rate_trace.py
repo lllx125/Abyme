@@ -9,7 +9,7 @@ import json
 GOOD = True
 BAD = False
 
-def _rate_all(input_path: Path, output_path: Path, score_function: Callable[[str, Dict[str, Any]], float], verbose: bool = True):
+def rate_all(input_path: Path, output_path: Path, score_function: Callable[[str, Dict[str, Any]], float], verbose: bool = True):
     """
     Rate all nodes from generated traces and output labeled training data.
 
