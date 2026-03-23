@@ -152,7 +152,7 @@ class MATH100Benchmark(MATH500Benchmark):
 if __name__ == "__main__":
     from abyme.vllm_model import LocalVLLMModel
 
-    MODEL_PATH = "unsloth/Qwen3.5-9B"
+    MODEL_PATH = "Lixing_Li/Abyme-Qwen3.5-9B-SFT"
     TEST_NAME = "qwen3.5-9b"
     MAX_WORKERS = 50
 
@@ -171,3 +171,7 @@ if __name__ == "__main__":
 
     benchmark.score_all(test_name=TEST_NAME, max_workers=MAX_WORKERS)
     benchmark.check_scores(test_name=TEST_NAME)
+    scores = benchmark.check_scores_by_level(
+        Path(f"results/{benchmark.name}/{TEST_NAME}_scored.jsonl"), TEST_NAME
+    )
+    benchmark.append_score_to_hub(scores, MODEL_PATH, TEST_NAME)

@@ -9,7 +9,145 @@ import json
 GOOD = True
 BAD = False
 
-def rate_all(input_path: Path, output_path: Path, score_function: Callable[[str, Dict[str, Any]], float], verbose: bool = True):
+def _rate_all(input_path: Path, output_path: Path, score_function: Callable[[str, Dict[str, Any]], float], verbose: bool = True):
+    """
+    Rate all nodes from generated traces and output labeled training data.
+
+    Reads trace results from input_path JSONL, extracts all nodes, computes future_length
+    for each node, and labels based on future_length percentiles.
+
+    Labeling Strategy:
+    1. For each question, label all nodes of the trace with correct final answer and minimum length as GOOD
+    2. Label all nodes with incorrect format, parent of FAIL node as BAD
+    3. Label failed/wrong answer trace level 0 as BAD
+   
+   
+    Args:
+        input_path: Path to JSONL file with trace results (from ParallelTreeOrchestrator)
+        output_path: Path to output JSONL file with labeled nodes
+        score_function: Function to score final answers (e.g., MATH500Benchmark.score)
+        verbose: If True, print label counts per category after rating.
+    """
+    # Dict key in the question index
+
+    correct_traces: Dict[int, List[TreeTraceNode]] = defaultdict(list)
+    
+    incorrect_traces: Dict[int, List[TreeTraceNode]] = defaultdict(list) # but not failed
+    
+    failed_traces: Dict[int, List[TreeTraceNode]] = defaultdict(list)
+    
+    all_traces: Dict[int, List[TreeTraceNode]] = defaultdict(list)
+    
+    # good nodes
+    good_nodes: List[TreeTraceNode] = []
+    # bad nodes
+    bad_nodes: List[TreeTraceNode] = []
+    
+    with input_path.open('r') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line.strip())
+            if 'trace_tree' not in record:
+                continue
+
+            trace = dict_to_node(record['trace_tree'])
+
+            # Score at the trace level using the pre-extracted final output.
+            # Individual nodes cannot determine answer correctness on their own.
+            try:
+                is_correct = score_function(record['output'], record) == 1.0
+            except Exception:
+                is_correct = False
+            
+            index = record.get("index", -1)
+            
+            if record.get("status") == "FAILED":
+                failed_traces[index].append(trace)
+            elif is_correct:
+                correct_traces[index].append(trace)
+            else:
+                incorrect_traces[index].append(trace)
+            all_traces[index].append(trace)
+    
+    # 1 Label GOOD nodes from correct traces with minimum length
+    for index in correct_traces:
+        if not correct_traces[index]:
+            continue
+        min_length_trace = correct_traces.index(min(correct_traces[index], key=lambda t: length(t)))
+        good_nodes.extend(collect_all_nodes(min_length_trace))
+    
+    good_count = len(good_nodes)
+    
+    bad_format_count = 0
+    bad_failed_count = 0
+    
+    # 2 Label BAD nodes with incorrect format, parent of FAIL node
+    for index in all_traces:
+        for trace in all_traces[index]:
+            nodes = collect_all_nodes(trace)
+            for node in nodes:
+                if not node.output:
+                    continue
+                if not verify_output_format_strict(node.output):
+                    bad_nodes.append(node)
+                    bad_format_count += 1
+                if node.status == "FAILED" and node.parent:
+                    bad_nodes.append(node.parent)
+                    bad_failed_count += 1
+
+    # 3 Label BAD nodes at depth 0 of failed traces
+    bad_failed_depth0_count = 0
+    for index in failed_traces:
+        for trace in failed_traces[index]:
+            bad_nodes.append(trace)
+            bad_nodes.extend(trace.past)
+            bad_failed_depth0_count += len(trace.past) + 1
+    
+    # 3 Label BAD nodes at depth 0 of incorrect traces
+    bad_incorrect_depth0_count = 0
+    for index in incorrect_traces:
+        for trace in incorrect_traces[index]:
+            bad_nodes.append(trace)
+            bad_nodes.extend(trace.past)
+            bad_incorrect_depth0_count += len(trace.past) + 1
+
+    if verbose:
+        print(f"\n{'='*50}")
+        print(f"Rate All: {input_path.name}")
+        print(f"{'='*50}")
+        print(f"  Total nodes          : {sum(len(collect_all_nodes(t)) for traces in all_traces.values() for t in traces)}")
+        print(f"  --- GOOD ---")
+        print(f"  Minimum length trace : {good_count}")
+        print(f"  --- BAD ---")
+        print(f"  Bad format           : {bad_format_count}")
+        print(f"  Parent of FAIL       : {bad_failed_count}")
+        print(f"  Failed depth-0       : {bad_failed_depth0_count}")
+        print(f"  Incorrect depth-0    : {bad_incorrect_depth0_count}")
+        print(f"  BAD total            : {len(bad_nodes)}")
+        print(f"{'='*50}\n")
+        
+    # --- Write labeled nodes to output ---
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open('w') as f:
+        for node in good_nodes:
+            record = {
+                "input": magic_formatter(node.prompt, node.main_problem, node.parent_problem, node.fragment),
+                "output": node.output,
+                "label": GOOD,
+            }
+            f.write(json.dumps(record) + '\n')
+        for node in bad_nodes:
+            record = {
+                "input": magic_formatter(node.prompt, node.main_problem, node.parent_problem, node.fragment),
+                "output": node.output,
+                "label": BAD,
+            }
+            f.write(json.dumps(record) + '\n')
+
+
+
+def rate_all_deprecated(input_path: Path, output_path: Path, score_function: Callable[[str, Dict[str, Any]], float], verbose: bool = True):
     """
     Rate all nodes from generated traces and output labeled training data.
 

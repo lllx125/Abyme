@@ -469,36 +469,11 @@ class DataManager(MATHFullBenchmark):
         self._upload_to_huggingface(output_path, repo_id=self.hf_repo_test_scored)
         return avg, [json.loads(l)['score'] for l in output_path.open()]
 
-    def check_scores_by_level(self) -> Tuple[float,float,float,float,float,float]:
+    def check_scores_by_level(self) -> Tuple[float, float, float, float, float, float]:
         """Print average score per level and total average from scored output file."""
-        if not self.test_scored_output_path.exists():
-            raise FileNotFoundError(f"Scored results file does not exist: {self.test_scored_output_path}")
-
-        level_scores: Dict[int, List[float]] = defaultdict(list)
-        all_scores: List[float] = []
-
-        with self.test_scored_output_path.open('r') as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                item = json.loads(line.strip())
-                score = item['score']
-                level = item['level_num']
-                level_scores[level].append(score)
-                all_scores.append(score)
-
-        print(f"\nScores for iteration {self.iteration}:")
-        print("-" * 35)
-        result = [0,0,0,0,0]
-        for level in sorted(level_scores):
-            scores = level_scores[level]
-            avg = sum(scores) / len(scores)
-            print(f"  Level {level}: {avg:.4f} ({int(sum(scores))}/{len(scores)} correct)")
-            result[level] = avg
-        print("-" * 35)
-        total_avg = sum(all_scores) / len(all_scores) if all_scores else 0.0
-        print(f"  Total:   {total_avg:.4f} ({int(sum(all_scores))}/{len(all_scores)} correct)")
-        return total_avg, result[0], result[1], result[2], result[3], result[4]
+        return super().check_scores_by_level(
+            self.test_scored_output_path, f"iteration {self.iteration}", level_field="level_num"
+        )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,8 @@ Purpose: MATH-500 dataset benchmark implementation as a child class of Benchmark
 
 import json
 import re
-from typing import Dict, Any
+from collections import defaultdict
+from typing import Dict, Any, List, Tuple
 from pathlib import Path
 from abyme.model import Model
 from benchmark.base import Benchmark, extract_boxed_answer
@@ -100,6 +101,100 @@ class MATH500Benchmark(Benchmark):
         return 1.0 if norm_gt == norm_model else 0.0
 
     # Helper methods
+
+    def append_score_to_hub(
+        self,
+        scores: Tuple[float, float, float, float, float, float],
+        model_path: str,
+        test_name: str,
+        repo_id: str = "Lixing-Li/Model-Scores",
+    ):
+        """Append a score record to a HuggingFace dataset.
+
+        Pulls the existing dataset if it exists, appends the new record, then pushes.
+        Creates the dataset from scratch if it does not exist yet.
+
+        Args:
+            scores: (total_avg, level1, level2, level3, level4, level5)
+            model_path: Model identifier (stored as metadata).
+            test_name: Test run name (stored as metadata).
+            repo_id: HuggingFace dataset repo to push to.
+        """
+        import os
+        import dotenv
+        from huggingface_hub import login
+        from datasets import Dataset, concatenate_datasets, load_dataset
+
+        dotenv.load_dotenv()
+        login(token=os.getenv("HF_TOKEN", ""), add_to_git_credential=True)
+
+        total, l1, l2, l3, l4, l5 = scores
+        new_record = {
+            "model": model_path,
+            "test_name": test_name,
+            "total": total,
+            "level_1": l1,
+            "level_2": l2,
+            "level_3": l3,
+            "level_4": l4,
+            "level_5": l5,
+        }
+
+        new_ds = Dataset.from_list([new_record])
+
+        try:
+            existing_ds = load_dataset(repo_id, split="train")
+            combined = concatenate_datasets([existing_ds, new_ds])
+        except Exception:
+            combined = new_ds
+
+        combined.push_to_hub(repo_id)
+        print(f"Score record pushed to https://huggingface.co/datasets/{repo_id}")
+
+    def check_scores_by_level(
+        self,
+        scored_path: Path,
+        label: str,
+        level_field: str = "level",
+    ) -> Tuple[float, float, float, float, float, float]:
+        """Print average score per level and total average from scored output file.
+
+        Args:
+            scored_path: Path to the scored JSONL file.
+            label: Display label (e.g. test_name or iteration number).
+            level_field: Name of the field in each record that holds the level (1-5).
+
+        Returns:
+            (total_avg, level1_avg, level2_avg, level3_avg, level4_avg, level5_avg)
+        """
+        if not scored_path.exists():
+            raise FileNotFoundError(f"Scored results file does not exist: {scored_path}")
+
+        level_scores: Dict[int, List[float]] = defaultdict(list)
+        all_scores: List[float] = []
+
+        with scored_path.open('r') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line.strip())
+                score = item['score']
+                level = item[level_field]
+                level_scores[level].append(score)
+                all_scores.append(score)
+
+        print(f"\nScores for {label}:")
+        print("-" * 35)
+        result = []
+        for level in sorted(level_scores):
+            scores = level_scores[level]
+            avg = sum(scores) / len(scores)
+            print(f"  Level {level}: {avg:.4f} ({int(sum(scores))}/{len(scores)} correct)")
+            result.append(avg)
+        print("-" * 35)
+        total_avg = sum(all_scores) / len(all_scores) if all_scores else 0.0
+        print(f"  Total:   {total_avg:.4f} ({int(sum(all_scores))}/{len(all_scores)} correct)")
+        return total_avg, result[0], result[1], result[2], result[3], result[4]
 
     def _normalize_answer(self, ans: str) -> str:
         """
