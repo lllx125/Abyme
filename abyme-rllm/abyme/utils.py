@@ -2,7 +2,7 @@
 Utility functions for text processing and XML tag extraction.
 """
 import re
-from typing import List
+from typing import List, Optional
 
 AND = "do"
 OR = "try"
@@ -219,6 +219,95 @@ def verify_format(trace: str) -> bool:
     return True
 
 
+def get_format_error(text: str, allow_extra_content: bool = False) -> Optional[str]:
+    """
+    Returns None if the text is valid, or an error string describing why it failed.
+    Follows the same logic as verify_output_format_strict.
+    """
+    if not text:
+        return "empty text"
+
+    text_stripped = text.strip()
+
+    if '<think>' in text_stripped:
+        return "has <think> open tag"
+
+    if '<response>' in text_stripped or '</response>' in text_stripped:
+        return "has <response> tag"
+
+    if '</think>' in text_stripped:
+        if text_stripped.count('</think>') != 1:
+            return "answer: multiple </think>"
+        think_pos = text_stripped.find('</think>')
+        if not text_stripped[think_pos + len('</think>'):].strip():
+            return "answer: empty after </think>"
+        if '## DO' in text_stripped or '## TRY' in text_stripped or '<do>' in text_stripped or '<try>' in text_stripped:
+            return "answer: mixed DO/TRY"
+        return None
+
+    if allow_extra_content:
+        do_pattern = r'##\s*DO\s+(\d+)\s*\n\s*>\s*[^\n]+\n.*?<do>.*?</do>'
+    else:
+        do_pattern = r'##\s*DO\s+(\d+)\s*\n\s*>\s*[^\n]+\n\s*<do>.*?</do>'
+    do_matches = list(re.finditer(do_pattern, text_stripped, re.DOTALL | re.MULTILINE))
+
+    if do_matches:
+        numbers = [int(m.group(1)) for m in do_matches]
+        for i in range(1, len(numbers)):
+            if numbers[i] != numbers[i-1] + 1:
+                return "do: non-consecutive numbers"
+        if '<try>' in text_stripped or '</try>' in text_stripped or '</think>' in text_stripped or '## TRY' in text_stripped:
+            return "do: mixed TRY/ANSWER"
+        if not _check_tag_pairing_and_nesting(text_stripped, 'do'):
+            return "do: unpaired/nested tags"
+        do_open_count = text_stripped.count('<do>')
+        do_close_count = text_stripped.count('</do>')
+        if do_open_count != do_close_count or do_open_count != len(do_matches):
+            return "do: tag count mismatch"
+        do_header_count = len(re.findall(r'##\s*DO\s+\d+', text_stripped))
+        if do_header_count != len(do_matches):
+            return "do: header count mismatch"
+        for match in do_matches:
+            block_text = text_stripped[match.start():match.end()]
+            if not re.search(r'\n\s*>\s*[^\n]+\n', block_text):
+                return "do: missing > description line"
+        return None
+
+    if allow_extra_content:
+        try_pattern = r'##\s*TRY\s+(\d+)\s*\n\s*>\s*[^\n]+\n.*?<try>.*?</try>'
+    else:
+        try_pattern = r'##\s*TRY\s+(\d+)\s*\n\s*>\s*[^\n]+\n\s*<try>.*?</try>'
+    try_matches = list(re.finditer(try_pattern, text_stripped, re.DOTALL | re.MULTILINE))
+
+    if try_matches:
+        if len(try_matches) < 2:
+            return "try: only 1 TRY block (need >=2)"
+        numbers = [int(m.group(1)) for m in try_matches]
+        for i in range(1, len(numbers)):
+            if numbers[i] != numbers[i-1] + 1:
+                return "try: non-consecutive numbers"
+        if '<do>' in text_stripped or '</do>' in text_stripped or '</think>' in text_stripped or '## DO' in text_stripped:
+            return "try: mixed DO/ANSWER"
+        if not _check_tag_pairing_and_nesting(text_stripped, 'try'):
+            return "try: unpaired/nested tags"
+        try_open_count = text_stripped.count('<try>')
+        try_close_count = text_stripped.count('</try>')
+        if try_open_count != try_close_count or try_open_count != len(try_matches):
+            return "try: tag count mismatch"
+        try_header_count = len(re.findall(r'##\s*TRY\s+\d+', text_stripped))
+        if try_header_count != len(try_matches):
+            return "try: header count mismatch"
+        return None
+
+    has_do = '## DO' in text_stripped or '<do>' in text_stripped or '</do>' in text_stripped
+    has_try = '## TRY' in text_stripped or '<try>' in text_stripped or '</try>' in text_stripped
+    if has_do:
+        return "do: partial/malformed structure"
+    if has_try:
+        return "try: partial/malformed structure"
+    return "no valid format (plain text)"
+
+
 def verify_output_format_strict(text: str, print_reason: bool = False, allow_extra_content: bool = False) -> bool:
     """
     Verify that the output follows one of three strict format cases: DO, TRY, or ANSWER.
@@ -277,222 +366,10 @@ def verify_output_format_strict(text: str, print_reason: bool = False, allow_ext
     Returns:
         bool: True if the text follows one of the three formats exactly, False otherwise
     """
-    if not text:
-        if print_reason:
-            print("Validation failed: Text is empty")
-        return False
-
-    text_stripped = text.strip()
-
-    # <think> opening tag cannot exist anywhere
-    if '<think>' in text_stripped:
-        if print_reason:
-            print("Validation failed: <think> opening tag is not allowed (only </think> allowed in ANSWER case)")
-        return False
-
-    # No <response> tags allowed in any case
-    if '<response>' in text_stripped or '</response>' in text_stripped:
-        if print_reason:
-            print("Validation failed: <response> tags are not allowed in any case")
-        return False
-
-    # Check for ANSWER case (contains </think>)
-    if '</think>' in text_stripped:
-        # </think> must appear exactly once
-        if text_stripped.count('</think>') != 1:
-            if print_reason:
-                print(f"Validation failed: ANSWER case must have exactly one </think> tag (found {text_stripped.count('</think>')})")
-            return False
-
-        # Find position of </think>
-        think_pos = text_stripped.find('</think>')
-
-        # Content after </think> must exist and be non-empty
-        final_answer = text_stripped[think_pos + len('</think>'):].strip()
-        if not final_answer:
-            if print_reason:
-                print("Validation failed: ANSWER case must have non-empty content after </think>")
-            return False
-
-        # ANSWER case cannot contain DO/TRY patterns
-        if '## DO' in text_stripped or '## TRY' in text_stripped:
-            if print_reason:
-                print("Validation failed: ANSWER case cannot contain ## DO or ## TRY headers")
-            return False
-
-        # ANSWER case cannot contain <do>/<try> tags
-        if '<do>' in text_stripped or '</do>' in text_stripped:
-            if print_reason:
-                print("Validation failed: ANSWER case cannot contain <do> tags")
-            return False
-        if '<try>' in text_stripped or '</try>' in text_stripped:
-            if print_reason:
-                print("Validation failed: ANSWER case cannot contain <try> tags")
-            return False
-
+    error = get_format_error(text, allow_extra_content=allow_extra_content)
+    if error is None:
         return True
-
-    # Check for DO case
-    # Pattern: ## DO <number>\n> <description>\n[optional content]\n<do>...</do>
-    if allow_extra_content:
-        # Allow any content between > line and <do> tag
-        do_pattern = r'##\s*DO\s+(\d+)\s*\n\s*>\s*[^\n]+\n.*?<do>.*?</do>'
-    else:
-        # Strict: only whitespace between > line and <do> tag
-        do_pattern = r'##\s*DO\s+(\d+)\s*\n\s*>\s*[^\n]+\n\s*<do>.*?</do>'
-    do_matches = list(re.finditer(do_pattern, text_stripped, re.DOTALL | re.MULTILINE))
-
-    if do_matches:
-        # Extract numbers and verify they're consecutive
-        numbers = [int(m.group(1)) for m in do_matches]
-        for i in range(1, len(numbers)):
-            if numbers[i] != numbers[i-1] + 1:
-                if print_reason:
-                    print(f"Validation failed: DO numbers must be consecutive (found {numbers[i-1]} followed by {numbers[i]})")
-                return False
-
-        # Verify no TRY blocks or </think> tags (cases are mutually exclusive)
-        if '<try>' in text_stripped or '</try>' in text_stripped or '</think>' in text_stripped:
-            if print_reason:
-                print("Validation failed: DO case cannot contain <try> tags or </think> (cases are mutually exclusive)")
-            return False
-
-        # Verify no ## TRY headers
-        if '## TRY' in text_stripped:
-            if print_reason:
-                print("Validation failed: DO case cannot contain ## TRY headers (cases are mutually exclusive)")
-            return False
-
-        # Verify all <do> tags are properly paired and not nested
-        if not _check_tag_pairing_and_nesting(text_stripped, 'do'):
-            if print_reason:
-                print("Validation failed: <do> tags are not properly paired or are nested")
-            return False
-
-        # Verify count: all <do> tags must be accounted for in pattern matches
-        do_open_count = text_stripped.count('<do>')
-        do_close_count = text_stripped.count('</do>')
-        if do_open_count != do_close_count or do_open_count != len(do_matches):
-            if print_reason:
-                print(f"Validation failed: Found {do_open_count} <do> and {do_close_count} </do> tags, but only {len(do_matches)} complete DO blocks")
-            return False
-
-        # Verify all ## DO headers have corresponding complete matches
-        do_header_count = len(re.findall(r'##\s*DO\s+\d+', text_stripped))
-        if do_header_count != len(do_matches):
-            if print_reason:
-                print(f"Validation failed: Found {do_header_count} ## DO headers but only {len(do_matches)} complete DO blocks")
-            return False
-
-        # Verify each ## DO has exactly one > following it
-        for match in do_matches:
-            # Extract text from ## DO to end of <do></do> block
-            block_text = text_stripped[match.start():match.end()]
-            # Check the > on its own line exists
-            if not re.search(r'\n\s*>\s*[^\n]+\n', block_text):
-                if print_reason:
-                    print("Validation failed: Each ## DO must have exactly one > line with description")
-                return False
-
-        return True
-
-    # Check for TRY case
-    # Pattern: ## TRY <number>\n> <description>\n[optional content]\n<try>...</try>
-    if allow_extra_content:
-        # Allow any content between > line and <try> tag
-        try_pattern = r'##\s*TRY\s+(\d+)\s*\n\s*>\s*[^\n]+\n.*?<try>.*?</try>'
-    else:
-        # Strict: only whitespace between > line and <try> tag
-        try_pattern = r'##\s*TRY\s+(\d+)\s*\n\s*>\s*[^\n]+\n\s*<try>.*?</try>'
-    try_matches = list(re.finditer(try_pattern, text_stripped, re.DOTALL | re.MULTILINE))
-
-    if try_matches:
-        # Must have at least 2 TRYs
-        if len(try_matches) < 2:
-            if print_reason:
-                print(f"Validation failed: TRY case must have at least 2 TRY blocks (found {len(try_matches)})")
-            return False
-
-        # Extract numbers and verify they're consecutive
-        numbers = [int(m.group(1)) for m in try_matches]
-        for i in range(1, len(numbers)):
-            if numbers[i] != numbers[i-1] + 1:
-                if print_reason:
-                    print(f"Validation failed: TRY numbers must be consecutive (found {numbers[i-1]} followed by {numbers[i]})")
-                return False
-
-        # Verify no DO blocks or </think> tags (cases are mutually exclusive)
-        if '<do>' in text_stripped or '</do>' in text_stripped or '</think>' in text_stripped:
-            if print_reason:
-                print("Validation failed: TRY case cannot contain <do> tags or </think> (cases are mutually exclusive)")
-            return False
-
-        # Verify no ## DO headers
-        if '## DO' in text_stripped:
-            if print_reason:
-                print("Validation failed: TRY case cannot contain ## DO headers (cases are mutually exclusive)")
-            return False
-
-        # Verify all <try> tags are properly paired and not nested
-        if not _check_tag_pairing_and_nesting(text_stripped, 'try'):
-            if print_reason:
-                print("Validation failed: <try> tags are not properly paired or are nested")
-            return False
-
-        # Verify count: all <try> tags must be accounted for in pattern matches
-        try_open_count = text_stripped.count('<try>')
-        try_close_count = text_stripped.count('</try>')
-        if try_open_count != try_close_count or try_open_count != len(try_matches):
-            if print_reason:
-                print(f"Validation failed: Found {try_open_count} <try> and {try_close_count} </try> tags, but only {len(try_matches)} complete TRY blocks")
-            return False
-
-        # Verify all ## TRY headers have corresponding complete matches
-        try_header_count = len(re.findall(r'##\s*TRY\s+\d+', text_stripped))
-        if try_header_count != len(try_matches):
-            if print_reason:
-                print(f"Validation failed: Found {try_header_count} ## TRY headers but only {len(try_matches)} complete TRY blocks")
-            return False
-
-        return True
-
-    # If none of the formats match, provide detailed diagnostics
     if print_reason:
-        # Check if there are partial DO structures
-        has_do_headers = '## DO' in text_stripped
-        has_do_tags = '<do>' in text_stripped or '</do>' in text_stripped
-        has_try_headers = '## TRY' in text_stripped
-        has_try_tags = '<try>' in text_stripped or '</try>' in text_stripped
-
-        if has_do_headers and has_do_tags:
-            do_header_count = len(re.findall(r'##\s*DO\s+\d+', text_stripped))
-            do_open_count = text_stripped.count('<do>')
-            do_close_count = text_stripped.count('</do>')
-            print(f"Validation failed: Found {do_header_count} ## DO headers and {do_open_count}/{do_close_count} <do></do> tags, but format is incorrect.")
-            if not allow_extra_content:
-                print("  Hint: Try setting allow_extra_content=True if there's content between '>' and '<do>' tag")
-            print(f"  Expected format: ## DO N\\n> description\\n<do>content</do>")
-        elif has_try_headers and has_try_tags:
-            try_header_count = len(re.findall(r'##\s*TRY\s+\d+', text_stripped))
-            try_open_count = text_stripped.count('<try>')
-            try_close_count = text_stripped.count('</try>')
-            print(f"Validation failed: Found {try_header_count} ## TRY headers and {try_open_count}/{try_close_count} <try></try> tags, but format is incorrect.")
-            if not allow_extra_content:
-                print("  Hint: Try setting allow_extra_content=True if there's content between '>' and '<try>' tag")
-            print(f"  Expected format: ## TRY N\\n> description\\n<try>content</try>")
-        elif has_do_headers or has_do_tags:
-            print("Validation failed: Partial DO structure detected but incomplete or malformed.")
-            print(f"  Has ## DO headers: {has_do_headers}")
-            print(f"  Has <do> tags: {has_do_tags}")
-        elif has_try_headers or has_try_tags:
-            print("Validation failed: Partial TRY structure detected but incomplete or malformed.")
-            print(f"  Has ## TRY headers: {has_try_headers}")
-            print(f"  Has <try> tags: {has_try_tags}")
-        else:
-            print("Validation failed: Text does not match any of the three required formats (DO, TRY, or ANSWER)")
-            print("  Expected formats:")
-            print("  - ANSWER: [reasoning]</think>\\n[answer]")
-            print("  - DO: [reasoning]## DO 1\\n> desc\\n<do>content</do>...")
-            print("  - TRY: [reasoning]## TRY 1\\n> desc\\n<try>content</try>... (minimum 2 TRYs)")
+        print(f"Validation failed: {error}")
     return False
 

@@ -23,7 +23,7 @@ class ParallelTreeOrchestrator:
     def __init__(self, 
                  base_model: LocalVLLMModel, 
                  output_jsonl_path: str = "results/results.jsonl",
-                 max_concurrent_trees: int = 20,  # 10 trees * 5 workers/tree = 50 concurrent vLLM requests
+                 max_concurrent_trees: int = 20,  # 20 trees * 3 workers/tree = 60 concurrent vLLM requests
                  **recursive_kwargs):
         """
         Initialize the Batch Runner.

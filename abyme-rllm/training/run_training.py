@@ -20,9 +20,9 @@ LORA_RANK = 64
 LORA_ALPHA = 128
 BATCH_SIZE = 2
 GRADIENT_ACCUMULATION_STEPS = 8
-LEARNING_RATE = 2e-6
+LEARNING_RATE = 5e-6
 NUM_EPOCHS = 1
-BETA = 0.2
+BETA = 0.1
 
 def run_training(model_name, dataset_id, hub_repo_id):
     HF_TOKEN = os.getenv("HF_TOKEN", "")                      # HuggingFace Write Token
@@ -57,7 +57,7 @@ def run_training(model_name, dataset_id, hub_repo_id):
     # ==========================================
     # PREPARE DATASET
     # ==========================================
-    dataset = load_dataset(dataset_id, split="train")
+    dataset = load_dataset(dataset_id, split="train").shuffle(seed=42)
 
     # TRL's KTOTrainer expects 'prompt', 'completion', and a boolean 'label'
     def format_kto_dataset(example):
@@ -91,7 +91,7 @@ def run_training(model_name, dataset_id, hub_repo_id):
     kto_args = KTOConfig(
         per_device_train_batch_size=BATCH_SIZE,   # A100 can handle larger batches; bump to 16 if VRAM allows
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        warmup_steps=50,
+        warmup_steps=10,
         num_train_epochs=NUM_EPOCHS,
         learning_rate=LEARNING_RATE,              # Preference tuning uses lower LRs than standard SFT
         fp16=not is_bfloat16_supported(),

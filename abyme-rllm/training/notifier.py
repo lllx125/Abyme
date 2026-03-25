@@ -45,15 +45,14 @@ class DiscordNotifier(Notifier):
                 return
 
         formatted_message = self._format_message(message)
+        print(formatted_message)
+        self._last_send_time = current_time
 
         if self.url is None:
-            print(formatted_message)
-            self._last_send_time = current_time
             return
 
         try:
             requests.post(self.url, json={"content": formatted_message})
-            self._last_send_time = current_time
         except Exception as e:
             # We print to stderr as a fallback if Discord fails, 
             # but we don't crash the program.
@@ -65,75 +64,3 @@ class DiscordNotifier(Notifier):
         return message
 
 mailman = DiscordNotifier()  # Global instance for easy use throughout the codebase
-
-class EmptyNotifier(Notifier):
-    """
-    A null object notifier that discards all messages.
-    Useful for testing or silent operation.
-    """
-    def send(self, message: str, important: bool = False) -> None:
-        pass
-
-class ConsoleNotifier(Notifier):
-    """
-    A notifier that prints messages to the console (stdout).
-    """
-    def send(self, message: str, important: bool = False) -> None:
-        if important:
-            # Important messages get their own line
-            print(message, file=sys.stdout)
-        else:
-            # Non-important messages (like progress bars) overwrite the current line.
-            # \x1b[K is an ANSI escape code to Clear the Line from cursor to end.
-            # This prevents "ghosting" where parts of a previous long message 
-            # remain visible after a shorter message is printed.
-            print(f"\r{message}\x1b[K", end="", file=sys.stdout, flush=True)
-
-class CompositeNotifier(Notifier):
-    """
-    A notifier that broadcasts messages to a list of other notifiers.
-    Example: Print to console AND send to Discord.
-    """
-    def __init__(self, notifiers: List[Notifier]):
-        self.notifiers = notifiers
-
-    def send(self, message: str, important: bool = False) -> None:
-        for notifier in self.notifiers:
-            try:
-                notifier.send(message, important)
-            except Exception as e:
-                # Prevent one failing notifier (e.g. Discord timeout) 
-                # from breaking the loop for others.
-                sys.stderr.write(f"Notifier failed: {e}\n")
-
-class StderrToNotifier:
-    """
-    A file-like object that captures stderr output (including tqdm progress bars)
-    and forwards clean text to a Notifier instance.
-    """
-    def __init__(self, notifier: Notifier):
-        self.notifier = notifier
-        self.buffer = ""
-        # Regex to remove ANSI color codes (e.g., \x1b[32m) which break Discord formatting
-        self.ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-
-    def write(self, text):
-        # 1. Pass through to actual console so user still sees it locally
-        sys.__stderr__.write(text)
-        
-        # 2. Accumulate in buffer
-        self.buffer += text
-        
-        # 3. Process lines (tqdm uses \r for updates)
-        if '\r' in self.buffer or '\n' in self.buffer:
-            # Clean ANSI codes
-            clean_msg = self.ansi_escape.sub('', self.buffer).strip()
-            self.buffer = ""
-            
-            if clean_msg:
-                # Send with important=False to let the Notifier throttle updates
-                self.notifier.send(clean_msg, important=False)
-
-    def flush(self):
-        sys.__stderr__.flush()
-        

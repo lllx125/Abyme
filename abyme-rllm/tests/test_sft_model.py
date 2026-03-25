@@ -6,22 +6,24 @@ This test loads the fine-tuned Abyme-Llama-3.1-8B model and runs a simple genera
 import sys
 
 from sft.load_sft_model import AbymeSFTHuggingFaceModel
+from abyme.vllm_model import LocalVLLMModel
 from abyme.core import RecursiveModel
 
 prompt = "What is the third derivative of e^{x^2}"
-#prompt = "There are exactly three positive real numbers $ k $ such that the function\n$ f(x) = \\frac{(x - 18)(x - 72)(x - 98)(x - k)}{x} $\ndefined over the positive real numbers achieves its minimum value at exactly two positive real numbers $ x $. Find the sum of these three values of $ k $.\n\nPlease provide your final answer in the format \\boxed{answer}, where answer is an integer between 0 and 999."
+prompt = "There are exactly three positive real numbers $ k $ such that the function\n$ f(x) = \\frac{(x - 18)(x - 72)(x - 98)(x - k)}{x} $\ndefined over the positive real numbers achieves its minimum value at exactly two positive real numbers $ x $. Find the sum of these three values of $ k $.\n\nPlease provide your final answer in the format \\boxed{answer}, where answer is an integer between 0 and 999."
 #prompt = "What is the least positive integer multiple of 30 that can be written with only the digits 0 and 2?"
 #prompt = "What is 1+1?"
 
 def main():
-    model_name = "Lixing-Li/Abyme-Qwen3.5-9B-SFT"
-    model = AbymeSFTHuggingFaceModel(model_name=model_name)
+    #model_name = "Lixing-Li/Abyme-Qwen3.5-9B-SFT"
+    model_name = "Lixing-Li/Abyme-Trained-Iteration-5"
+    model = LocalVLLMModel(model_path=model_name)
+    #model = AbymeSFTHuggingFaceModel(model_name=model_name)
     print("Model loaded successfully!")
-    output = model.generate(prompt)
-    print(output)
-    abyme = RecursiveModel(base_model=model, print_progress=True)
+    abyme = RecursiveModel(base_model=model, print_progress=True, max_call=2000, max_depth=12,max_parallel_workers=50)
     output = abyme.generate(prompt)
     print(output)
+    #model.shutdown()
 
 
 if __name__ == "__main__":

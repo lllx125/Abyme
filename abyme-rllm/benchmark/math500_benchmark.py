@@ -102,53 +102,6 @@ class MATH500Benchmark(Benchmark):
 
     # Helper methods
 
-    def append_score_to_hub(
-        self,
-        scores: Tuple[float, float, float, float, float, float],
-        test_name: str,
-        repo_id: str = "Lixing-Li/Model-Scores",
-    ):
-        """Append a score record to a HuggingFace dataset.
-
-        Pulls the existing dataset if it exists, appends the new record, then pushes.
-        Creates the dataset from scratch if it does not exist yet.
-
-        Args:
-            scores: (total_avg, level1, level2, level3, level4, level5)
-            test_name: Test run name (stored as metadata).
-            repo_id: HuggingFace dataset repo to push to.
-        """
-        import os
-        import dotenv
-        from huggingface_hub import login
-        from datasets import Dataset, concatenate_datasets, load_dataset
-
-        dotenv.load_dotenv()
-        login(token=os.getenv("HF_TOKEN", ""), add_to_git_credential=True)
-
-        total, l1, l2, l3, l4, l5 = scores
-        new_record = {
-            "test_name": test_name,
-            "total": total,
-            "level_1": l1,
-            "level_2": l2,
-            "level_3": l3,
-            "level_4": l4,
-            "level_5": l5,
-        }
-
-        new_ds = Dataset.from_list([new_record])
-
-        try:
-            existing_ds = load_dataset(repo_id, split="train")
-            combined = concatenate_datasets([existing_ds, new_ds])
-        except Exception:
-            combined = new_ds
-
-        combined.push_to_hub(repo_id)
-        print(f"Score record pushed to https://huggingface.co/datasets/{repo_id}")
-
-
     def _check_scores_from_path(
         self,
         scored_path: Path,

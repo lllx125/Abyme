@@ -1,8 +1,8 @@
 from pathlib import Path
-from abyme.tree_trace import TreeTraceNode, fold, length, dict_to_node, future_length, collect_all_nodes
+from abyme.tree_trace import TreeTraceNode, length, dict_to_node, future_length, collect_all_nodes
 from abyme.utils import AND, OR
-from typing import Tuple, Callable, Dict, Any, List, Optional
-from abyme.utils import verify_output_format_strict
+from typing import Callable, Dict, Any, List
+from abyme.utils import verify_output_format_strict, get_format_error
 from abyme.magic import magic_formatter
 from collections import defaultdict
 import json
@@ -18,7 +18,7 @@ def rate_all(input_path: Path, output_path: Path, score_function: Callable[[str,
     for each node, and labels based on future_length percentiles.
 
     Labeling Strategy:
-    1. For each question, label all nodes of the trace with correct final answer and minimum length as GOOD
+    1. For each question, label all nodes of the trace with correct final answer and minimum length as GOOD (2 per unique problem)
     2. Label all nodes with incorrect format, parent of FAIL node as BAD
     3. Label failed/wrong answer trace level 0 as BAD
     4. Add AND/OR nodes with lower future_length from each correct trace as GOOD and BAD nodes balances
@@ -71,51 +71,58 @@ def rate_all(input_path: Path, output_path: Path, score_function: Callable[[str,
                 incorrect_traces[prompt].append(trace)
             all_traces[prompt].append(trace)
 
-    # 1 Label GOOD nodes from correct traces with minimum length (one per unique problem)
+    # 1 Label GOOD nodes from correct traces with minimum length (2 per unique problem)
     for prompt in correct_traces:
         if not correct_traces[prompt]:
             continue
-        min_length_trace = min(correct_traces[prompt], key=lambda t: length(t))
-        good_nodes.extend(
-            node for node in collect_all_nodes(min_length_trace)
-            if node.output and node.status not in ("FAILED", "CANCELLED")
-        )
+        sorted_traces = sorted(correct_traces[prompt], key=lambda t: length(t))
+        top_traces = sorted_traces[:2] if len(sorted_traces) >= 2 else sorted_traces[:1]
+        for trace in top_traces:
+            good_nodes.extend(
+                node for node in collect_all_nodes(trace)
+                if node.output and node.status not in ("FAILED", "CANCELLED")
+                and verify_output_format_strict(node.output)
+            )
     
     good_count = len(good_nodes)
     
     bad_format_count = 0
     bad_failed_count = 0
-    
+    bad_format_reasons: Dict[str, int] = defaultdict(int)
+
     # 2 Label BAD nodes with incorrect format, parent of FAIL node
     for prompt in all_traces:
         for trace in all_traces[prompt]:
             nodes = collect_all_nodes(trace)
             for node in nodes:
-                if node.output and not verify_output_format_strict(node.output):
-                    bad_nodes.append(node)
-                    bad_format_count += 1
-                if node.status == "FAILED":
-                    # Prefer the spatial parent; fall back to last temporal past node
-                    culprit = node.parent if node.parent else (node.past[-1] if node.past else None)
-                    if culprit and culprit.output:
-                        bad_nodes.append(culprit)
-                        bad_failed_count += 1
+                if node.output:
+                    err = get_format_error(node.output)
+                    if err is not None:
+                        bad_nodes.append(node)
+                        bad_format_count += 1
+                        bad_format_reasons[err] += 1
+                # if node.status == "FAILED":
+                #     # Prefer the spatial parent; fall back to last temporal past node
+                #     culprit = node.parent if node.parent else (node.past[-1] if node.past else None)
+                #     if culprit and culprit.output:
+                #         bad_nodes.append(culprit)
+                #         bad_failed_count += 1
 
     # 3 Label BAD nodes at depth 0 of failed traces
     bad_failed_depth0_count = 0
     for prompt in failed_traces:
         for trace in failed_traces[prompt]:
-            bad_nodes.append(trace)
-            bad_nodes.extend(trace.past)
-            bad_failed_depth0_count += len(trace.past) + 1
+            nodes_to_add = [n for n in [trace] + list(trace.past) if n.output]
+            bad_nodes.extend(nodes_to_add)
+            bad_failed_depth0_count += len(nodes_to_add)
 
     # 3 Label BAD nodes at depth 0 of incorrect traces
     bad_incorrect_depth0_count = 0
     for prompt in incorrect_traces:
         for trace in incorrect_traces[prompt]:
-            bad_nodes.append(trace)
-            bad_nodes.extend(trace.past)
-            bad_incorrect_depth0_count += len(trace.past) + 1
+            nodes_to_add = [n for n in [trace] + list(trace.past) if n.output]
+            bad_nodes.extend(nodes_to_add)
+            bad_incorrect_depth0_count += len(nodes_to_add)
 
     # 4 Add AND/OR nodes (lowest future_length) from correct traces as GOOD until balanced
     # Sample uniformly per prompt: each prompt contributes at most its fair share.
@@ -132,6 +139,7 @@ def rate_all(input_path: Path, output_path: Path, score_function: Callable[[str,
                 for trace in correct_traces[prompt]
                 for node in collect_all_nodes(trace)
                 if node.type in (AND, OR) and node.output and node.status not in ("FAILED", "CANCELLED")
+                and verify_output_format_strict(node.output)
             ]
             candidates.sort(key=lambda n: future_length(n))
             to_add = candidates[:quota]
@@ -139,20 +147,33 @@ def rate_all(input_path: Path, output_path: Path, score_function: Callable[[str,
             and_or_good_count += len(to_add)
 
     if verbose:
-        print(f"\n{'='*50}")
-        print(f"Rate All: {input_path.name}")
-        print(f"{'='*50}")
-        print(f"  Total nodes          : {sum(len(collect_all_nodes(t)) for traces in all_traces.values() for t in traces)}")
-        print(f"  --- GOOD ---")
-        print(f"  Minimum length trace : {good_count}")
-        print(f"  AND/OR low future_L  : {and_or_good_count}")
-        print(f"  --- BAD ---")
-        print(f"  Bad format           : {bad_format_count}")
-        print(f"  Parent of FAIL       : {bad_failed_count}")
-        print(f"  Failed depth-0       : {bad_failed_depth0_count}")
-        print(f"  Incorrect depth-0    : {bad_incorrect_depth0_count}")
-        print(f"  BAD total            : {len(bad_nodes)}")
-        print(f"{'='*50}\n")
+        from notifier import mailman
+        sep = '=' * 50
+        total_nodes = sum(len(collect_all_nodes(t)) for traces in all_traces.values() for t in traces)
+        format_breakdown = "\n".join(
+            f"    {reason:<35}: {count}"
+            for reason, count in sorted(bad_format_reasons.items(), key=lambda x: -x[1])
+        )
+        msg = "\n".join([
+            sep,
+            f"Rate All: {input_path.name}",
+            sep,
+            f"  Total nodes          : {total_nodes}",
+            f"  --- GOOD ---",
+            f"  Minimum length trace : {good_count}",
+            f"  AND/OR low future_L  : {and_or_good_count}",
+            f"  GOOD total           : {len(good_nodes)}",
+            f"  --- BAD ---",
+            f"  Bad format           : {bad_format_count}",
+            format_breakdown,
+            f"  Parent of FAIL       : {bad_failed_count}",
+            f"  Failed depth-0       : {bad_failed_depth0_count}",
+            f"  Incorrect depth-0    : {bad_incorrect_depth0_count}",
+            f"  BAD total            : {len(bad_nodes)}",
+            sep,
+        ])
+        mailman.send(msg)
+
         
     # --- Write labeled nodes to output ---
     output_path.parent.mkdir(parents=True, exist_ok=True)

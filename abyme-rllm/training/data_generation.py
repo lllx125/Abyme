@@ -473,7 +473,6 @@ class DataManager(MATHFullBenchmark):
         """Print average score per level and total average from scored output file."""
         test_name = f"iteration_{self.iteration}"
         results = self._check_scores_from_path(self.test_scored_output_path, test_name, level_field="level_num")
-        self.append_score_to_hub(scores=results, test_name=test_name)
         return results
 
 
