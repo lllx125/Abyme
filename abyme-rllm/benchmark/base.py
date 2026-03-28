@@ -12,6 +12,7 @@ from tqdm import tqdm
 from math import comb
 from abyme.model import Model
 from abc import ABC, abstractmethod
+from abyme.recursive_engine import RecursiveEngine
 
 class Benchmark(ABC):
     """
@@ -93,6 +94,52 @@ class Benchmark(ABC):
                     # Write to output file immediately
                     outfile.write(json.dumps(output_record) + '\n')
                     outfile.flush()  # Ensure it's written immediately
+
+    def generate_all_batch(
+        self,
+        engine: RecursiveEngine,
+        test_name: str,
+        problem_key: str = "problem"
+    ):
+        """
+        Generate model outputs for the entire benchmark using RecursiveEngine.
+
+        Submits all problems as a single batch to the shared worker pool for
+        maximum parallelism. Results are written to results/{name}/{test_name}.jsonl.
+
+        Args:
+            engine: RecursiveEngine instance
+            test_name: Name for this generation run (used for output file naming)
+            problem_key: Key in each JSON record that holds the problem string
+        """
+        input_path = Path(f"data/{self.name}.jsonl")
+        output_path = Path(f"results/{self.name}/{test_name}.jsonl")
+
+        if not input_path.exists():
+            raise FileNotFoundError(f"Dataset file does not exist: {input_path}")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        records = []
+        with input_path.open('r') as f:
+            for line in f:
+                if line.strip():
+                    records.append(json.loads(line.strip()))
+
+        prompts = [r[problem_key] for r in records]
+
+        results = engine.process_batch(prompts, str(output_path))
+
+        # Re-merge original record fields into each result and re-save
+        merged = []
+        result_by_index = {r['index']: r for r in results}
+        for i, record in enumerate(records):
+            res = result_by_index.get(i, {})
+            merged.append({**record, 'output': res.get('output', ''), **res})
+
+        with output_path.open('w') as f:
+            for row in merged:
+                f.write(json.dumps(row) + '\n')
 
     @abstractmethod
     def score(self, model_output: str, input: Dict[str, Any]) -> float:

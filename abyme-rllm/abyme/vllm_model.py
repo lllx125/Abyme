@@ -88,6 +88,7 @@ class APIModel(Model):
 class LocalVLLMModel(Model):
     def __init__(self, 
                  model_path: str, 
+                 lora_path: Optional[str] = None,
                  tensor_parallel_size: int = 1,
                  gpu_memory_utilization: float = 0.9,
                  max_model_len: int = 8192,
@@ -105,6 +106,7 @@ class LocalVLLMModel(Model):
         self.system_prompt = system_prompt
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.lora_path = lora_path
         
         # 1. Load the tokenizer
         print("Loading tokenizer...")
@@ -141,7 +143,10 @@ class LocalVLLMModel(Model):
             max_num_seqs=256,          
             enforce_eager=True,           
             enable_chunked_prefill=False,       
-            trust_remote_code=True
+            trust_remote_code=True,
+            enable_lora=True if lora_path else False,   
+            max_loras=1 if lora_path else None,         
+            max_lora_rank=64 if lora_path else None,    
         )
         
         print(f"Loading {model_path} (bfloat16) into vLLM engine on A100...")
@@ -183,8 +188,10 @@ class LocalVLLMModel(Model):
 
     async def _async_generate(self, formatted_prompt: str) -> str:
         from vllm import SamplingParams
+        from vllm.lora.request import LoRARequest
         
         request_id = str(uuid.uuid4())
+        lora_request = LoRARequest("grpo_adapter", 1, self.lora_path) if self.lora_path else None
         
         # Inject the dynamically built stop token list
         sampling_params = SamplingParams(
@@ -198,7 +205,8 @@ class LocalVLLMModel(Model):
         results_generator = self.engine.generate(
             engine_inputs, 
             sampling_params, 
-            request_id
+            request_id,
+            lora_request=lora_request
         )
         
         final_output = ""

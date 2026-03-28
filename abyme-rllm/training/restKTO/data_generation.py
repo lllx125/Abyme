@@ -14,9 +14,9 @@ from tqdm import tqdm
 
 from benchmark.math_full_benchmark import MATHFullBenchmark
 from benchmark.base import extract_boxed_answer
-from abyme.batch_runner import ParallelTreeOrchestrator
+from abyme.recursive_engine import RecursiveEngine
 from abyme.model import Model
-from training.rate_trace import rate_all
+from training.restKTO.rate_trace import rate_all
 from abyme.vllm_model import LocalVLLMModel
 
 class DataManager(MATHFullBenchmark):
@@ -236,20 +236,20 @@ class DataManager(MATHFullBenchmark):
     def generate_all(
         self,
         model: LocalVLLMModel,
+        max_workers: int = 60,
         **recursive_kwargs
     ):
         """
-        Generate model outputs for training data using ParallelTreeOrchestrator.
+        Generate model outputs for training data using RecursiveEngine.
 
         Generates num_gen_per_question outputs for each training question,
-        saves to results/{iteration}_results.jsonl, and optionally uploads to HF.
+        saves to results/{iteration}_results.jsonl, and uploads to HF.
 
         Args:
             model: The model to use for generation
-            max_concurrent_trees: Number of concurrent trees for ParallelTreeOrchestrator
-            upload_to_hf: Whether to upload results to HuggingFace
-            hf_repo_id: HuggingFace repo ID (e.g., "username/dataset-name")
-            **recursive_kwargs: Additional arguments for RecursiveModel
+            max_workers: Total shared worker threads across all trees
+            **recursive_kwargs: Additional arguments for RecursiveEngine
+                (max_depth, max_call, max_chain_length, proceed_when_fail, ...)
         """
         output_path = self.train_output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,10 +262,9 @@ class DataManager(MATHFullBenchmark):
         print(f"Total generations: {len(self.train_data) * self.num_gen_per_question}")
         print(f"Output path: {output_path}")
 
-        # Create orchestrator
-        orchestrator = ParallelTreeOrchestrator(
+        engine = RecursiveEngine(
             base_model=model,
-            output_jsonl_path=str(output_path),
+            max_workers=max_workers,
             **recursive_kwargs
         )
 
@@ -278,7 +277,7 @@ class DataManager(MATHFullBenchmark):
                 problem_indices.append((idx, gen_idx))
 
         # Run batch generation
-        results = orchestrator.run_batch(prompts)
+        results = engine.process_batch(prompts, str(output_path))
         model.shutdown()
 
         # Augment results with original problem data, matching by result index
@@ -333,6 +332,7 @@ class DataManager(MATHFullBenchmark):
     def test_all(
         self,
         model: LocalVLLMModel,
+        max_workers: int = 60,
         **recursive_kwargs
     ):
         """
@@ -343,8 +343,8 @@ class DataManager(MATHFullBenchmark):
 
         Args:
             model: The model to use for testing
-            max_concurrent_trees: Number of concurrent trees
-            **recursive_kwargs: Additional arguments for RecursiveModel
+            max_workers: Total shared worker threads across all trees
+            **recursive_kwargs: Additional arguments for RecursiveEngine
         """
         output_path = self.test_output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -355,10 +355,9 @@ class DataManager(MATHFullBenchmark):
         print(f"Test samples: {len(self.test_data)}")
         print(f"Output path: {output_path}")
 
-        # Create orchestrator
-        orchestrator = ParallelTreeOrchestrator(
+        engine = RecursiveEngine(
             base_model=model,
-            output_jsonl_path=str(output_path),
+            max_workers=max_workers,
             **recursive_kwargs
         )
 
@@ -366,7 +365,7 @@ class DataManager(MATHFullBenchmark):
         prompts = [item['problem'] for item in self.test_data]
 
         # Run batch testing
-        results = orchestrator.run_batch(prompts)
+        results = engine.process_batch(prompts, str(output_path))
         model.shutdown()
 
         # Augment results with original problem data, matching by result index
@@ -479,13 +478,13 @@ class DataManager(MATHFullBenchmark):
 if __name__ == "__main__":
     base_model = "Lixing-Li/Abyme-Qwen3.5-9B-Test-KTO"
     iteration = 0
-    sample = (10,10,10,10,10) 
-    test = (10,10,10,10,10)
+    sample = (10, 10, 10, 10, 10)
+    test = (10, 10, 10, 10, 10)
     data_manager = DataManager(iteration=iteration, samples=sample, tests=test, num_gen_per_question=2)
     model = LocalVLLMModel(model_path=base_model)
     print("Model loaded successfully!")
-    data_manager.test_all(model=model, max_depth=5, max_parallel_workers=5, max_call=50, max_chain_length=5)
+    data_manager.test_all(model=model, max_workers=25, max_depth=5, max_call=50, max_chain_length=5)
     data_manager.score_all()
     data_manager.check_scores_by_level()
-    # data_manager.generate_all(model=model, max_concurrent_trees=10, max_depth=5, max_parallel_workers=5, max_call=50, max_chain_length=5)
+    # data_manager.generate_all(model=model, max_workers=50, max_depth=5, max_call=50, max_chain_length=5)
     # data_manager.rate_all()

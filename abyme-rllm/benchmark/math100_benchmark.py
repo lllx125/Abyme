@@ -3,8 +3,8 @@ MATH-100 Benchmark
 
 Purpose: MATH-100 dataset benchmark — 20 randomly sampled questions per difficulty
 level (5 levels = 100 total). Subclass of MATH500Benchmark that overrides
-generate_all and score_all with parallel ThreadPoolExecutor for vLLM throughput,
-and inherits score() from MATH500Benchmark.
+generate_all with RecursiveEngine for vLLM throughput, and score_all with
+parallel ThreadPoolExecutor. Inherits score() from MATH500Benchmark.
 """
 
 import json
@@ -12,7 +12,7 @@ from typing import Dict, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from abyme.batch_runner import ParallelTreeOrchestrator
+from abyme.recursive_engine import RecursiveEngine
 from abyme.vllm_model import LocalVLLMModel
 from benchmark.math500_benchmark import MATH500Benchmark
 
@@ -20,7 +20,7 @@ from benchmark.math500_benchmark import MATH500Benchmark
 class MATH100Benchmark(MATH500Benchmark):
     """
     MATH-100: 20 randomly sampled questions per difficulty level (5 levels = 100 total).
-    Overrides generate_all with ParallelTreeOrchestrator for vLLM throughput,
+    Overrides generate_all with RecursiveEngine for vLLM throughput,
     and score_all with parallel ThreadPoolExecutor. Inherits score() from MATH500Benchmark.
     """
 
@@ -69,15 +69,22 @@ class MATH100Benchmark(MATH500Benchmark):
 
         print(f"MATH-100 saved to {output_path} ({len(selected)} problems)")
 
-    def generate_all(self, model: LocalVLLMModel, test_name: str, **recursive_kwargs):
+    def generate_all(
+        self,
+        model: LocalVLLMModel,
+        test_name: str,
+        max_workers: int = 60,
+        **recursive_kwargs
+    ):
         """
-        Parallel generation using ParallelTreeOrchestrator to saturate the vLLM async engine.
+        Batch generation using RecursiveEngine shared worker pool.
 
         Args:
-            model: An instance of LocalVLLMModel
+            model: An instance of LocalVLLMModel or APIModel
             test_name: Name for this run (used for output file naming)
-            **recursive_kwargs: Arguments passed to ParallelTreeOrchestrator / RecursiveModel
-                                 (e.g., max_concurrent_trees, max_depth, max_parallel_workers)
+            max_workers: Total shared worker threads across all trees
+            **recursive_kwargs: Arguments passed to RecursiveEngine
+                                 (max_depth, max_call, max_chain_length, ...)
         """
         input_path = Path(f"data/{self.name}.jsonl")
         output_path = Path(f"results/{self.name}/{test_name}.jsonl")
@@ -90,14 +97,14 @@ class MATH100Benchmark(MATH500Benchmark):
         with input_path.open("r") as f:
             problems = [json.loads(line) for line in f if line.strip()]
 
-        orchestrator = ParallelTreeOrchestrator(
+        engine = RecursiveEngine(
             base_model=model,
-            output_jsonl_path=str(output_path),
+            max_workers=max_workers,
             **recursive_kwargs
         )
 
         prompts = [item["problem"] for item in problems]
-        results = orchestrator.run_batch(prompts)
+        results = engine.process_batch(prompts, str(output_path))
         model.shutdown()
 
         # Augment results with original problem metadata
@@ -173,9 +180,8 @@ if __name__ == "__main__":
     benchmark.generate_all(
         model,
         test_name=TEST_NAME,
-        max_concurrent_trees=20,
+        max_workers=100,   # 20 trees * 5 workers equivalent
         max_depth=5,
-        max_parallel_workers=5,
         max_call=50,
         max_chain_length=5,
     )

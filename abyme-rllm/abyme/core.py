@@ -1,8 +1,12 @@
 """
 Recursive engine for processing elaborate/response cycles using RecursiveModel pattern.
+
+DEPRECATED: This module is kept for backwards compatibility.
+Please use RecursiveEngine from abyme.recursive_engine instead.
 """
 import time
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, TYPE_CHECKING
 
@@ -12,11 +16,6 @@ from .tree_trace import TreeTraceNode
 from .tree_manager import TreeManager
 from .model import Model, DeepSeekModel, GPTModel, ErrorGuardModel
 from .magic import *
-
-# Lazy imports - only load torch/transformers when needed for HuggingFace models
-# This allows lightweight usage with DeepSeek/GPT without installing heavy dependencies
-if TYPE_CHECKING:
-    from .pytorch_modules import HuggingFaceModel
 
 
 class RecursiveModel(Model):
@@ -42,6 +41,10 @@ class RecursiveModel(Model):
         """
         Initialize the multi-threaded recursive model.
 
+        DEPRECATED: RecursiveModel is deprecated. Use RecursiveEngine instead:
+            from abyme.recursive_engine import RecursiveEngine
+            engine = RecursiveEngine(base_model=base_model, max_workers=max_parallel_workers, ...)
+
         Args:
             base_model: The underlying Model to use for generation.
             guard_model: Model to use when max recursion depth is reached (forces a leaf response).
@@ -52,6 +55,12 @@ class RecursiveModel(Model):
             formatter: Function to format prompt context for the LLM.
             print_progress: If True, prints thread-safe debug logs to the console.
         """
+        warnings.warn(
+            "RecursiveModel is deprecated and will be removed in a future version. "
+            "Use RecursiveEngine instead: from abyme.recursive_engine import RecursiveEngine",
+            DeprecationWarning,
+            stacklevel=2
+        )
         self.base_model = base_model
         self.guard_model = guard_model
         self.max_depth = max_depth

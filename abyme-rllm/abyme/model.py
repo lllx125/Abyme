@@ -8,15 +8,6 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-
-def __getattr__(name):
-    """Lazy import mechanism for HuggingFaceModel to avoid PyTorch dependency."""
-    if name == "HuggingFaceModel":
-        from .pytorch_modules import HuggingFaceModel
-        return HuggingFaceModel
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 class Model(ABC):
     """Abstract base class for language models."""
 

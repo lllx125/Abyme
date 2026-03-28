@@ -1,31 +1,53 @@
 """
-Abyme: A Recursive Language Model with XML-based elaboration system.
+Abyme: Recursive reasoning engine with XML-based delegation.
 
-This package implements a recursive reasoning system where language models can:
-- Plan their responses using <think> tags
-- Recursively elaborate on sub-problems using <elaborate> tags
-- Receive responses in <response> tags
-- Control execution flow with </run> tokens
+A model can break a problem into subproblems (<do> / <try> tags), dispatch them
+to sub-agents in parallel, and reconstruct the answer from their responses.
 
-Example:
-    >>> from abyme import RLLMEngine, create_recursive_model
-    >>>
-    >>> # High-level engine interface (recommended)
-    >>> # User can pass any HF arguments (quantization, device_map, etc.)
-    >>> engine = RLLMEngine(
-    ...     model_name="meta-llama/Llama-2-7b-chat-hf",
-    ...     device_map="auto",
-    ...     load_in_4bit=True,
-    ...     max_recursion_depth=3
-    ... )
-    >>> output = engine.generate("Solve this problem...", max_attempt=3)
-    >>>
-    >>> # Or use factory functions for more control
-    >>> model = create_recursive_model(
-    ...     "meta-llama/Llama-2-7b-chat-hf",
-    ...     quantization="4bit",
-    ...     max_depth=3,
-    ...     max_call=20
-    ... )
-    >>> result = model.generate("What is 5*5 + 3*3?", max_attempt=3)
+Recommended usage:
+    from abyme import RecursiveEngine
+    from abyme.vllm_model import LocalVLLMModel, APIModel
+
+    model = LocalVLLMModel("path/to/model")
+    engine = RecursiveEngine(base_model=model, max_workers=60)
+
+    # Single prompt
+    answer = engine.generate("Differentiate e^x sin(x).")
+
+    # Batch — writes JSONL with full trace trees
+    engine.process_batch(prompts, output_jsonl_path="results.jsonl")
+
+    # Restart from a node in a previous trace
+    engine.continue_from_node(some_node)
 """
+
+from .recursive_engine import RecursiveEngine
+from .global_task_manager import GlobalTaskManager
+from .tree_trace import TreeTraceNode, to_dict, dict_to_node, clone_node_with_new_parent
+from .model import Model, ErrorGuardModel, DeepSeekModel, GPTModel
+from .magic import magic_formatter, magic_prompt, abyme_system_prompt
+
+# Deprecated — kept for backwards compatibility
+from .core import RecursiveModel, Abyme_API_Model
+from .batch_runner import ParallelTreeOrchestrator
+
+__all__ = [
+    # Current API
+    "RecursiveEngine",
+    "GlobalTaskManager",
+    "TreeTraceNode",
+    "to_dict",
+    "dict_to_node",
+    "clone_node_with_new_parent",
+    "Model",
+    "ErrorGuardModel",
+    "DeepSeekModel",
+    "GPTModel",
+    "magic_formatter",
+    "magic_prompt",
+    "abyme_system_prompt",
+    # Deprecated
+    "RecursiveModel",
+    "Abyme_API_Model",
+    "ParallelTreeOrchestrator",
+]

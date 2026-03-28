@@ -8,7 +8,7 @@ Generation -> Rating -> KTO Training -> Testing -> Scoring -> Level Upgrade
 import multiprocessing
 from typing import Tuple
 
-from training.data_generation import DataManager
+from training.restKTO.data_generation import DataManager
 from training.notifier import mailman
 
 NUM_GEN_PER_QUESTION = 10

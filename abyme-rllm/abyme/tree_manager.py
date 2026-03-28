@@ -3,7 +3,7 @@ Tree Manager Module for Agent 4.0 Architecture
 Handles thread-safe execution, Greedy DFS task selection, state resolution, and failure injection.
 """
 import threading
-from typing import Optional
+from typing import Optional, List
 
 # Assuming these are imported from your project structure
 from .utils import AND, OR, LEAF, THINK, extract_delegations, replace_delegations_with_responses
@@ -13,15 +13,22 @@ class TreeManager:
     """
     Thread-safe orchestrator for the RecursiveModel generation tree.
     """
-    
-    def __init__(self, root: TreeTraceNode, proceed_when_fail: bool = True):
+
+    def __init__(
+        self,
+        root: TreeTraceNode,
+        proceed_when_fail: bool = True,
+        shared_lock: Optional[threading.RLock] = None,
+        shared_condition: Optional[threading.Condition] = None
+    ):
         self.root: TreeTraceNode = root
         self.proceed_when_fail: bool = proceed_when_fail
-        
-        # Concurrency Primitives
-        self.lock = threading.RLock()
-        self.worker_condition = threading.Condition(self.lock)
-        
+
+        # Use provided shared lock (from GlobalTaskManager) or create a private one.
+        # Sharing the lock with GlobalTaskManager avoids cross-lock deadlocks.
+        self.lock = shared_lock if shared_lock is not None else threading.RLock()
+        self.worker_condition = shared_condition if shared_condition is not None else threading.Condition(self.lock)
+
         # Execution State
         self.is_finished: bool = False
 
@@ -40,29 +47,65 @@ class TreeManager:
         """Recursive helper for Greedy DFS."""
         if node.is_cancelled or node.status in ["COMPLETED", "FINAL", "FAILED"]:
             return None
-            
+
         if node.status == "WAIT_GEN":
             return node
-            
+
         if node.status == "WAIT_SUB":
             # Filter valid children
             valid_children = [
-                c for c in node.subproblems 
+                c for c in node.subproblems
                 if not c.is_cancelled and c.status not in ["COMPLETED", "FINAL", "FAILED"]
             ]
-            
+
             if not valid_children:
                 return None
-                
+
             # Greedy Selection: Evaluate the easiest path first
             valid_children.sort(key=lambda c: c.difficulty)
-            
+
             for child in valid_children:
                 best_leaf = self._dfs_find_best(child)
                 if best_leaf:
                     return best_leaf
-                    
+
         return None
+
+    def get_all_pending_tasks(self) -> List[TreeTraceNode]:
+        """
+        Get all nodes currently in WAIT_GEN state.
+
+        Returns:
+            List of all pending task nodes
+        """
+        with self.lock:
+            return self._collect_pending(self.root)
+
+    def _collect_pending(self, node: TreeTraceNode) -> List[TreeTraceNode]:
+        """Recursively collect all WAIT_GEN nodes."""
+        if node.is_cancelled or node.status in ["COMPLETED", "FINAL", "FAILED"]:
+            return []
+
+        if node.status == "WAIT_GEN":
+            return [node]
+
+        pending = []
+        for child in node.subproblems:
+            pending.extend(self._collect_pending(child))
+
+        return pending
+
+    def get_best_pending_task(self) -> Optional[TreeTraceNode]:
+        """
+        Get the easiest pending task without marking it as GENERATING.
+
+        Used by GlobalTaskManager for cross-tree scheduling.
+
+        Returns:
+            Easiest pending task or None
+        """
+        with self.lock:
+            return self._dfs_find_best(self.root)
 
     def report_success(self, node: TreeTraceNode, output: str):
         """

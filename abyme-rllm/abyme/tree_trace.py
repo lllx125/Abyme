@@ -3,7 +3,7 @@ Tree Trace Module
 Handles the state, hierarchy, history, and metrics of the generation tree.
 """
 from typing import List, Optional, Literal, Dict, Tuple, Callable, Any
-from .utils import format_output, AND, OR, LEAF
+from abyme.utils import format_output, AND, OR, LEAF
 
 NodeStatus = Literal["WAIT_GEN", "GENERATING", "WAIT_SUB", "COMPLETED", "FINAL", "FAILED", "CANCELLED"]
 
@@ -306,6 +306,150 @@ def dict_to_node(node_dict: Dict[str, Any], parent: Optional[TreeTraceNode] = No
 
     return node
 
+
+def deep_clone_subtree(
+    node: TreeTraceNode,
+    new_parent: Optional[TreeTraceNode] = None
+) -> TreeTraceNode:
+    """
+    Deep clone a node and all descendants, preserving all state exactly.
+
+    Used for cloning sibling subtrees that are already complete (FINAL/FAILED)
+    so their outputs remain visible to the parent after continuation.
+
+    Args:
+        node: The node to clone
+        new_parent: Parent in the new tree (None for roots / past nodes)
+
+    Returns:
+        Fully independent clone with identical state
+    """
+    cloned_past = [deep_clone_subtree(p, None) for p in node.past]
+
+    cloned = TreeTraceNode(
+        prompt=node.prompt,
+        fragment=node.fragment,
+        parent=new_parent,
+        past=cloned_past,
+        index=node.index
+    )
+    cloned.main_problem = node.main_problem
+    cloned.parent_problem = node.parent_problem
+    cloned.depth = node.depth
+    cloned.output = node.output
+    cloned.type = node.type
+    cloned.status = node.status
+    cloned.difficulty = node.difficulty
+    cloned.is_cancelled = node.is_cancelled
+    cloned.latency = node.latency
+    cloned.error_message = node.error_message
+
+    for sub in node.subproblems:
+        cloned.subproblems.append(deep_clone_subtree(sub, cloned))
+
+    return cloned
+
+
+def clone_trace_for_continuation(
+    source_node: TreeTraceNode,
+) -> Tuple[TreeTraceNode, TreeTraceNode]:
+    """
+    Clone an entire trace and reset source_node for fresh regeneration.
+
+    Walks the parent chain from source_node to the root to build a path of
+    ancestors.  Each ancestor on the path is cloned with status=WAIT_SUB and
+    its original output preserved (so the engine knows what subproblems it
+    spawned).  Completed siblings are deep-cloned as-is so their outputs
+    remain available when the parent continues generating after source_node
+    finishes.  source_node itself is cloned with status=WAIT_GEN, empty
+    output/subproblems, and its past chain preserved (temporal context for
+    the model).
+
+    Why parent links give WAIT_SUB ancestors:
+        continue_generation() creates a *new* node (the temporal continuation)
+        but does NOT update the old node's parent pointer.  Child nodes keep
+        parent = the WAIT_SUB version that originally spawned them, not the
+        continuation node.  So following parent links from source_node gives
+        exactly the WAIT_SUB snapshots we need.
+
+    Args:
+        source_node: Node to restart (will be reset; original is unchanged)
+
+    Returns:
+        (cloned_root, cloned_source_node)
+            cloned_root        — top-level ancestor ready for the engine
+            cloned_source_node — reset to WAIT_GEN with past preserved
+    """
+    # Build path: [source_node, parent, grandparent, ..., root]
+    path: List[TreeTraceNode] = []
+    node = source_node
+    while node is not None:
+        path.append(node)
+        node = node.parent
+
+    def _clone_on_path(
+        path_node: TreeTraceNode,
+        depth_in_path: int,
+        new_parent: Optional[TreeTraceNode]
+    ) -> TreeTraceNode:
+        # Temporal history is always preserved as-is for context
+        cloned_past = [deep_clone_subtree(p, None) for p in path_node.past]
+
+        cloned = TreeTraceNode(
+            prompt=path_node.prompt,
+            fragment=path_node.fragment,
+            parent=new_parent,
+            past=cloned_past,
+            index=path_node.index
+        )
+        cloned.main_problem = path_node.main_problem
+        cloned.parent_problem = path_node.parent_problem
+        cloned.depth = path_node.depth
+        cloned.latency = path_node.latency
+
+        if depth_in_path == 0:
+            # source_node: reset for fresh regeneration
+            cloned.output = ""
+            cloned.type = LEAF
+            cloned.status = "WAIT_GEN"
+            cloned.difficulty = 1
+            cloned.is_cancelled = False
+            cloned.error_message = ""
+            # subproblems left empty — engine will populate during generation
+        else:
+            # Ancestor: restore WAIT_SUB state with original output intact.
+            cloned.output = path_node.output
+            cloned.type = path_node.type
+            cloned.status = "WAIT_SUB"
+            cloned.difficulty = path_node.difficulty
+            cloned.is_cancelled = False
+            cloned.error_message = ""
+
+            next_on_path = path[depth_in_path - 1]
+            for sub in path_node.subproblems:
+                
+                # ---> THE FIX: Match by index, not memory id() <---
+                if sub.index == next_on_path.index:
+                    # Force the clone to follow our specific historical path_node,
+                    # effectively discarding any newer temporal continuations in this branch.
+                    sub_clone = _clone_on_path(next_on_path, depth_in_path - 1, cloned)
+                else:
+                    # Sibling — preserve output so parent can inject it
+                    sub_clone = deep_clone_subtree(sub, cloned)
+                
+                cloned.subproblems.append(sub_clone)
+
+        return cloned
+
+    cloned_root = _clone_on_path(path[-1], len(path) - 1, None)
+    # Navigate from cloned_root down to cloned_source_node using path indices
+    cloned_source = cloned_root
+    for i in range(len(path) - 2, -1, -1):
+        cloned_source = cloned_source.subproblems[path[i].index]
+
+    return cloned_root, cloned_source
+
+
 from typing import List
 
 def future_length(node: TreeTraceNode) -> int:
@@ -331,7 +475,7 @@ def future_length(node: TreeTraceNode) -> int:
     # 3. Determine the "immediate past" nodes
     length_of_immediate_past = length(node.past[-1]) if node.past else 0.0
     
-    # 5. Apply the formula
+    # 4. Apply the formula
     return end_of_chain_length - length_of_immediate_past
 
 def draw_tree(
