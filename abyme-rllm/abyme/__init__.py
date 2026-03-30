@@ -19,35 +19,10 @@ Recommended usage:
 
     # Restart from a node in a previous trace
     engine.continue_from_node(some_node)
+
+    # Abort all in-progress generations from another thread
+    engine.abort()
 """
 
-from .recursive_engine import RecursiveEngine
-from .global_task_manager import GlobalTaskManager
-from .tree_trace import TreeTraceNode, to_dict, dict_to_node, clone_node_with_new_parent
-from .model import Model, ErrorGuardModel, DeepSeekModel, GPTModel
-from .magic import magic_formatter, magic_prompt, abyme_system_prompt
-
-# Deprecated — kept for backwards compatibility
-from .core import RecursiveModel, Abyme_API_Model
-from .batch_runner import ParallelTreeOrchestrator
-
-__all__ = [
-    # Current API
-    "RecursiveEngine",
-    "GlobalTaskManager",
-    "TreeTraceNode",
-    "to_dict",
-    "dict_to_node",
-    "clone_node_with_new_parent",
-    "Model",
-    "ErrorGuardModel",
-    "DeepSeekModel",
-    "GPTModel",
-    "magic_formatter",
-    "magic_prompt",
-    "abyme_system_prompt",
-    # Deprecated
-    "RecursiveModel",
-    "Abyme_API_Model",
-    "ParallelTreeOrchestrator",
-]
+from abyme.recursive_engine import RecursiveEngine
+from abyme.tree_trace import CancelToken

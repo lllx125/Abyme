@@ -160,59 +160,74 @@ class LocalVLLMModel(Model):
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def generate(self, prompt: str, max_attempt: int = 1) -> str:
+    def generate(self, prompt: str, max_attempt: int = 1, cancel_token=None) -> str:
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": prompt}
         ]
-        
+
         formatted_prompt = self.tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
+            messages,
+            tokenize=False,
             add_generation_prompt=True
         )
-        
+
         last_error = None
         for _ in range(max_attempt):
+            if cancel_token is not None and cancel_token.is_cancelled:
+                raise Exception("Generation cancelled before attempt")
+            request_id = str(uuid.uuid4())
             try:
                 future = asyncio.run_coroutine_threadsafe(
-                    self._async_generate(formatted_prompt), 
+                    self._async_generate(formatted_prompt, request_id, cancel_token),
                     self.loop
                 )
                 return future.result()
             except Exception as e:
                 last_error = e
                 continue
-                
+
         raise Exception(f"LocalVLLMModel failed after {max_attempt} attempts. Last error: {last_error}")
 
-    async def _async_generate(self, formatted_prompt: str) -> str:
+    async def _async_generate(self, formatted_prompt: str, request_id: str, cancel_token=None) -> str:
         from vllm import SamplingParams
         from vllm.lora.request import LoRARequest
-        
-        request_id = str(uuid.uuid4())
+
         lora_request = LoRARequest("grpo_adapter", 1, self.lora_path) if self.lora_path else None
-        
+
         # Inject the dynamically built stop token list
         sampling_params = SamplingParams(
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             stop_token_ids=self.stop_token_ids
         )
-        
+
         engine_inputs = {"prompt": formatted_prompt}
-        
-        results_generator = self.engine.generate(
-            engine_inputs, 
-            sampling_params, 
-            request_id,
-            lora_request=lora_request
-        )
-        
-        final_output = ""
-        async for request_output in results_generator:
-            final_output = request_output.outputs[0].text
-            
+
+        # Register abort so cancel_token.cancel() kills this request mid-stream
+        if cancel_token is not None:
+            def _abort():
+                asyncio.run_coroutine_threadsafe(self.engine.abort(request_id), self.loop)
+            cancel_token.register_abort(_abort)
+
+        try:
+            results_generator = self.engine.generate(
+                engine_inputs,
+                sampling_params,
+                request_id,
+                lora_request=lora_request
+            )
+
+            final_output = ""
+            async for request_output in results_generator:
+                if cancel_token is not None and cancel_token.is_cancelled:
+                    await self.engine.abort(request_id)
+                    raise asyncio.CancelledError("Generation cancelled mid-stream")
+                final_output = request_output.outputs[0].text
+        finally:
+            if cancel_token is not None:
+                cancel_token.register_abort(None)  # unregister; request is done
+
         return final_output.strip()
     
     def shutdown(self):

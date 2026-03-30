@@ -1,63 +1,78 @@
 """
-Data Generation for Recursive GRPO Training
-
-Generates grouped training data for Policy Gradient with KL penalty.
-For each problem, recursively walks the reference trace and generates
-a group of `group_size` outputs per node, scored by the GRPO reward.
-
-Reward formula:
-    R_i = f_i * c_i * exp(-alpha * max(0, (l_i - mu_l) / mu_l)^2)
-
-    f_i  = 1 if output has valid format, else 0
-    c_i  = 1 if final answer is correct, else 0
-    l_i  = future_length(node)
-    mu_l = mean future_length of correct traces in the group
+data_generation.py
+Recursive GRPO Data Generator for a SINGLE problem.
 """
 
 import json
 import math
 import random
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+import threading
+import statistics
+import os
 
 from abyme.magic import magic_formatter
 from abyme.recursive_engine import RecursiveEngine
-from abyme.tree_trace import (
-    TreeTraceNode,
-    dict_to_node,
-    future_length,
-)
+from abyme.tree_trace import TreeTraceNode, dict_to_node, length
 from abyme.utils import verify_output_format_strict
 from abyme.vllm_model import LocalVLLMModel
 from benchmark.math_full_benchmark import MATHFullBenchmark
 
-ALPHA = 1.0  # Penalty strength for above-average length in GRPO reward
-TEMPERATURE = 1.0  # Softmax temperature for reference trace selection (lower = greedier)
-GROUP_SIZE = 64  # Number of traces generated per node in the reference trace
+PROBLEM_PER_PHASE = 100
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _compute_advantages(
-    nodes: List[TreeTraceNode],
-    correctness: List[bool],
-    alpha: float,
-) -> List[float]:
-    """
-    Compute normalized GRPO advantages for a group of nodes.
-    """
-    import statistics
-    
-    f = [1.0 if verify_output_format_strict(n.output) else 0.0 for n in nodes]
-    lengths = [future_length(n) for n in nodes]
+def _safe_verify_format(text: str) -> bool:
+    """Safeguard wrapper to prevent regex catastrophic backtracking on massive strings."""
+    if not text:
+        return False
+    if len(text) > 4000:
+        return False
+    return verify_output_format_strict(text)
 
-    correct_lengths = [l for l, c in zip(lengths, correctness) if c]
-    mu_l = (sum(correct_lengths) / len(correct_lengths)) if correct_lengths else (
+def _calculate_future_length(final_root: TreeTraceNode, first_node: TreeTraceNode) -> float:
+    path_indices = []
+    curr = first_node
+    while curr.parent is not None:
+        path_indices.append(curr.index)
+        curr = curr.parent
+    path_indices.reverse()
+
+    end_node = final_root
+    for idx in path_indices:
+        end_node = end_node.subproblems[idx]
+
+    end_len = length(end_node)
+    past_len = length(first_node.past[-1]) if first_node.past else 0.0
+    return float(end_len - past_len)
+
+def _compute_advantages(final_roots: List[TreeTraceNode], first_nodes: List[TreeTraceNode], correctness: List[bool], alpha: float) -> List[float]:
+    print("      [Debug] Starting _compute_advantages...")
+    sys.stdout.flush()
+    
+    f = []
+    for i, n in enumerate(first_nodes):
+        # Verbose print so you can see exactly where it freezes if it ever happens again
+        print(f"        [Debug] Advantage Format Check Trace {i} (len: {len(n.output)})... ", end="")
+        sys.stdout.flush()
+        
+        is_valid = _safe_verify_format(n.output)
+        f.append(1.0 if is_valid else 0.0)
+        
+        print("Done.")
+        sys.stdout.flush()
+
+    lengths = [_calculate_future_length(end_n, fn) for end_n, fn in zip(final_roots, first_nodes)]
+    
+    correct_valid_lengths = [l for l, c, fi in zip(lengths, correctness, f) if c and fi == 1.0]
+    mu_l = (sum(correct_valid_lengths) / len(correct_valid_lengths)) if correct_valid_lengths else (
         sum(lengths) / len(lengths) if lengths else 1.0
     )
 
-    # 1. Calculate Raw Rewards (R_i)
     raw_rewards = []
     for fi, li, ci in zip(f, lengths, correctness):
         ci_val = 1.0 if ci else 0.0
@@ -65,47 +80,44 @@ def _compute_advantages(
         r = fi * ci_val * math.exp(-alpha * excess ** 2)
         raw_rewards.append(r)
 
-    # 2. Normalize to get Advantages (A_i)
     if len(raw_rewards) > 1:
         mean_r = statistics.mean(raw_rewards)
         std_r = statistics.stdev(raw_rewards) + 1e-8
         advantages = [(r - mean_r) / std_r for r in raw_rewards]
     else:
-        advantages = [0.0] # Fallback if group size is 1
+        advantages = [0.0]
 
     return advantages
 
+def _pick_reference_index(final_roots: List[TreeTraceNode], first_nodes: List[TreeTraceNode], correctness: List[bool], temperature: float) -> int:
+    print("      [Debug] Starting _pick_reference_index...")
+    sys.stdout.flush()
+    
+    f = []
+    for i, n in enumerate(first_nodes):
+        is_valid = _safe_verify_format(n.output)
+        f.append(1.0 if is_valid else 0.0)
+        
+    lengths = [_calculate_future_length(end_n, fn) for end_n, fn in zip(final_roots, first_nodes)]
 
-def _pick_reference_index(
-    roots: List[TreeTraceNode],
-    correctness: List[bool],
-    temperature: float,
-) -> int:
-    """
-    Pick the index of the reference trace using temperature-weighted sampling.
-
-    Shorter future_length → higher probability. Falls back to all traces if
-    none are correct.
-
-    Args:
-        roots:       Root nodes of all traces in the group.
-        correctness: Per-trace correctness flags.
-        temperature: Softmax temperature (lower → greedier selection).
-
-    Returns:
-        Index into roots/correctness of the chosen reference trace.
-    """
-    candidates = [(i, future_length(r)) for i, r in enumerate(roots) if correctness[i]]
+    candidates = [(i, lengths[i]) for i in range(len(final_roots)) if correctness[i] and f[i] == 1.0]
+    
     if not candidates:
-        candidates = [(i, future_length(r)) for i, r in enumerate(roots)]
-
-    if temperature <= 0.0 or len(candidates) == 1:
+        candidates = [(i, lengths[i]) for i in range(len(final_roots)) if first_nodes[i].output]
+        
+    if temperature <= 0.0 or len(candidates) <= 1:
+        if not candidates: return 0
         return min(candidates, key=lambda x: x[1])[0]
 
-    # Softmax on negative length / temperature  →  shorter = higher weight
-    lengths = [l for _, l in candidates]
-    max_l = max(lengths)
-    weights = [math.exp(-(l - max_l) / temperature) for l in lengths]
+    cand_lengths = [l for _, l in candidates]
+    
+    # THE FIX: Shift by the minimum length to prevent Math Overflow
+    min_l = min(cand_lengths) 
+    
+    # Now the shortest length gets exp(0) = 1.0. 
+    # Longer lengths get exp(-large_number), which safely underflows to 0.0.
+    weights = [math.exp(-(l - min_l) / temperature) for l in cand_lengths]
+    
     total = sum(weights)
     weights = [w / total for w in weights]
 
@@ -113,502 +125,333 @@ def _pick_reference_index(
     cumulative = 0.0
     for (idx, _), w in zip(candidates, weights):
         cumulative += w
-        if r <= cumulative:
-            return idx
+        if r <= cumulative: return idx
     return candidates[-1][0]
 
-
 def _ordered_nodes(root: TreeTraceNode) -> List[TreeTraceNode]:
-    """
-    Return nodes from the reference trace in the order we should generate groups.
-
-    Traversal: for each temporal step (oldest past → current), process all spatial
-    children recursively before moving to the next temporal step.
-
-    Concretely, for a stored trace root:
-        root.past = [wait_sub_state_0, wait_sub_state_1, ...]
-        root itself = final temporal state (ANSWER or last continuation)
-
-    The returned order is:
-        past[0], past[0].children recursively,
-        past[1], past[1].children recursively,
-        ...,
-        root, root.children recursively
-
-    Only nodes that have non-empty output are included (skips empty/failed states).
-    """
     result: List[TreeTraceNode] = []
-
     def _visit(node: TreeTraceNode):
-        if not node.output:
-            return
+        if not node.output: return
         result.append(node)
         for child in node.subproblems:
             _visit(child)
-
-    # Temporal chain: oldest past first, then current node
-    temporal_chain = list(root.past) + [root]
-    for temporal_node in temporal_chain:
+    for temporal_node in list(root.past) + [root]:
         _visit(temporal_node)
-
     return result
-
 
 # ---------------------------------------------------------------------------
 # DataManager
 # ---------------------------------------------------------------------------
 
 class DataManager(MATHFullBenchmark):
-    """
-    Data manager for Recursive GRPO training on the MATH dataset.
-
-    For each training problem, generates groups of `group_size` outputs per
-    node in the reference trace and writes {input, output, advantage} records
-    to a JSONL file.
-    """
-
-    def __init__(
-        self,
-        samples: Tuple[int, int, int, int, int],
-        tests: Tuple[int, int, int, int, int],
-        iteration: int,
-        group_size: int = GROUP_SIZE,
-        temperature: float = TEMPERATURE,
-        alpha: float = ALPHA,
-        seed: int = 42,
-    ):
-        """
-        Args:
-            samples:    5-tuple of training samples per level (levels 1-5).
-            tests:      5-tuple of test samples per level (levels 1-5).
-            iteration:  Iteration number used in file naming.
-            group_size: Number of traces generated per node (default 64).
-            temperature: Softmax temperature for reference trace selection.
-            alpha:      Penalty exponent in the reward formula.
-            seed:       Random seed for reproducibility.
-        """
+    def __init__(self, group_size: int = 64, temperature: float = 1.0, alpha: float = 1.0):
         super().__init__()
-        self.samples = samples
-        self.tests = tests
-        self.iteration = iteration
         self.group_size = group_size
         self.temperature = temperature
         self.alpha = alpha
-        self.seed = seed
+        self.train_file = Path("data/grpo_train_curriculum.jsonl")
+        self.test_file = Path("data/grpo_test_set.jsonl")
 
-        self.train_data: List[Dict[str, Any]] = []
-        self.test_data: List[Dict[str, Any]] = []
-
-        self.train_data_path = Path(f"data/grpo_{self.iteration}.jsonl")
-        self.train_output_path = Path(f"results/grpo_{self.iteration}_train.jsonl")
-        self.test_output_path = Path(f"results/grpo_{self.iteration}_test_results.jsonl")
-        self.test_scored_output_path = Path(f"results/grpo_{self.iteration}_test_scored.jsonl")
-
-        self._load_and_select_data()
-
-    # ------------------------------------------------------------------
-    # Data selection (mirrors restKTO DataManager)
-    # ------------------------------------------------------------------
-
-    def _load_and_select_data(self):
-        """Load MATH full dataset and select training/test subsets."""
-        from collections import defaultdict
-
-        saved_path = self.train_data_path
-        if saved_path.exists():
-            print(f"Loading previously selected data from {saved_path}")
-            with saved_path.open("r") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    item = json.loads(line.strip())
-                    if item.get("selected_split") == "train":
-                        self.train_data.append(item)
-                    elif item.get("selected_split") == "test":
-                        self.test_data.append(item)
-            print(f"Loaded {len(self.train_data)} training, {len(self.test_data)} test samples")
+    # ==========================================
+    # CURRICULUM MANAGEMENT
+    # ==========================================
+    def prepare_datasets(self, raw_data_file: str = "data/math_full.jsonl", test_samples_per_level: int = 50):
+        if self.train_file.exists() and self.test_file.exists():
+            print(f"    [Info] Curriculum already exists at {self.train_file}. Using existing split.")
             return
 
-        data_path = Path("data/math_full.jsonl")
-        if not data_path.exists():
+        print("    [Info] Building new curriculum and test sets...")
+        if not os.path.exists(raw_data_file):
+            print("    [Info] Downloading MATH dataset...")
             self.download()
 
-        all_data: List[Dict[str, Any]] = []
-        with data_path.open("r") as f:
+        levels_train = {1: [], 2: [], 3: [], 4: [], 5: []}
+        levels_test = {1: [], 2: [], 3: [], 4: [], 5: []}
+        
+        with open(raw_data_file, "r") as f:
             for line in f:
                 if line.strip():
-                    all_data.append(json.loads(line.strip()))
+                    item = json.loads(line)
+                    lvl = item.get("level_num", 1)
+                    if item.get("selected_split") == "test" or item.get("training") is False:
+                         levels_test[lvl].append(item)
+                    else:
+                         levels_train[lvl].append(item)
+        
+        test_data = []
+        for l in range(1, 6):
+            missing = test_samples_per_level - len(levels_test[l])
+            if missing > 0:
+                random.shuffle(levels_train[l])
+                levels_test[l].extend(levels_train[l][:missing])
+                levels_train[l] = levels_train[l][missing:]
+            
+            levels_test[l] = levels_test[l][:test_samples_per_level]
+            test_data.extend(levels_test[l])
 
-        grouped = defaultdict(list)
-        for item in all_data:
-            key = (item["level_num"], item["type"], item["training"])
-            grouped[key].append(item)
+        curriculum = self._build_progressive_curriculum(levels_train)
 
-        random.seed(self.seed)
-
-        def _select(level: int, is_train: bool, n_total: int) -> List[Dict[str, Any]]:
-            subjects = {k[1] for k in grouped if k[0] == level and k[2] == is_train}
-            per_subject = max(1, n_total // len(subjects)) if subjects else 0
-            selected: List[Dict[str, Any]] = []
-            for subj in sorted(subjects):
-                available = grouped[(level, subj, is_train)]
-                n = min(per_subject, len(available))
-                selected.extend(random.sample(available, n))
-            if len(selected) < n_total:
-                remaining = [
-                    item for subj in subjects
-                    for item in grouped[(level, subj, is_train)]
-                    if item not in selected
-                ]
-                extra = min(n_total - len(selected), len(remaining))
-                selected.extend(random.sample(remaining, extra))
-            return selected[:n_total]
-
-        print(f"Selecting data for iteration {self.iteration}")
-        for level in range(1, 6):
-            train_items = _select(level, True, self.samples[level - 1])
-            self.train_data.extend(train_items)
-            test_items = _select(level, False, self.tests[level - 1])
-            self.test_data.extend(test_items)
-            print(f"  Level {level}: {len(train_items)} train, {len(test_items)} test")
-
-        print(f"Total: {len(self.train_data)} train, {len(self.test_data)} test")
-
-        saved_path.parent.mkdir(parents=True, exist_ok=True)
-        with saved_path.open("w") as f:
-            for item in self.train_data:
-                item["selected_split"] = "train"
+        self.train_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.train_file.open("w") as f:
+            for item in curriculum:
                 f.write(json.dumps(item) + "\n")
-            for item in self.test_data:
-                item["selected_split"] = "test"
+                
+        with self.test_file.open("w") as f:
+            for item in test_data:
                 f.write(json.dumps(item) + "\n")
+                
+        print(f"    [Success] Saved {len(curriculum)} training and {len(test_data)} test problems.")
 
-    # ------------------------------------------------------------------
-    # Score override (use ground_truth field from MATH full dataset)
-    # ------------------------------------------------------------------
+    def _build_progressive_curriculum(self, levels_train: Dict[int, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+            for l in levels_train.values():
+                random.shuffle(l)
+            
+            curriculum = []
+            phases = [
+                (0.7, 0.2, 0.1, 0.0, 0.0), 
+                (0.3, 0.4, 0.2, 0.1, 0.0), 
+                (0.1, 0.2, 0.4, 0.2, 0.1), 
+                (0.0, 0.1, 0.3, 0.4, 0.2), 
+                (0.0, 0.0, 0.1, 0.4, 0.5)  
+            ]
+            
+            total_problems = PROBLEM_PER_PHASE * len(phases)
+
+            for step in range(total_problems):
+                phase_idx = step // PROBLEM_PER_PHASE
+                weights = phases[phase_idx]
+                
+                available_levels = [l for l in range(1, 6) if levels_train.get(l)]
+                if not available_levels: 
+                    break
+                
+                active_weights = [weights[l-1] for l in available_levels]
+                weight_sum = sum(active_weights)
+                active_weights = [w / weight_sum for w in active_weights] if weight_sum > 0 else [1.0 / len(available_levels)] * len(available_levels)
+
+                chosen_level = random.choices(available_levels, weights=active_weights, k=1)[0]
+                curriculum.append(levels_train[chosen_level].pop())
+
+            return curriculum
+
+    def load_curriculum(self) -> List[Dict[str, Any]]:
+        with self.train_file.open("r") as f:
+            return [json.loads(line) for line in f if line.strip()]
+            
+    def load_test_set(self) -> List[Dict[str, Any]]:
+        with self.test_file.open("r") as f:
+            return [json.loads(line) for line in f if line.strip()]
 
     def score(self, model_output: str, input: Dict[str, Any]) -> float:
-        """Score using ground_truth field."""
         input_with_answer = {**input, "answer": input.get("ground_truth", input.get("answer", ""))}
         return super().score(model_output, input_with_answer)
 
-    # ------------------------------------------------------------------
-    # Core group generation
-    # ------------------------------------------------------------------
-
-    def generate_group(
-        self,
-        problem: Dict[str, Any],
-        engine: RecursiveEngine,
-        output_path: Path,
-        file_lock,
-    ):
-        """
-
-        Generate GRPO training data for a single problem.
-        Generates `group_size` traces from the root, scores them, picks the
-        reference trace (shortest correct), then recursively generates groups
-        for each node in the reference trace using continue_from_node.
-        Each written record:
-        {"input": <magic_formatter output>, "output": <node.output>, "advantage": <float>}
-        Args:
-        problem: Dict with 'problem' (prompt) and 'ground_truth' fields.
-        engine: RecursiveEngine instance (shared across calls).
-        output_path: JSONL file to append records to.
-        file_lock: threading.Lock for safe concurrent writes.
-        """
-        import threading
-        from abyme.utils import verify_output_format_strict
-
+    # ==========================================
+    # GRPO GENERATION LOGIC
+    # ==========================================
+    def generate(self, problem: Dict[str, Any], engine: RecursiveEngine, output_path: Path):
+        file_lock = threading.Lock()
         prompt = problem["problem"]
 
-        # --- Step 1: Generate group_size traces from root ---
+        print(f"\n    >>> Generating Initial {self.group_size} Traces from Root...")
+        sys.stdout.flush()
+        
         prompts = [prompt] * self.group_size
         tmp_path = output_path.parent / f"_tmp_grpo_{id(threading.current_thread())}.jsonl"
         try:
             results = engine.process_batch(prompts, str(tmp_path))
         finally:
-            if tmp_path.exists():
-                tmp_path.unlink()
+            if tmp_path.exists(): 
+                try:
+                    tmp_path.unlink()
+                except Exception as e:
+                    print(f"    [Warning] Could not delete temp file: {e}")
 
-        # Reconstruct root nodes and check correctness
-        roots: List[TreeTraceNode] = []
-        correctness: List[bool] = []
-        for res in results:
-            root_node = dict_to_node(res["trace_tree"])
-            roots.append(root_node)
-            is_correct = (
-                res.get("status") == "SUCCESS"
-                and self.score(res.get("output", ""), problem) == 1.0
-            )
+        print("    [Debug] process_batch completed. Parsing results & Scoring...")
+        sys.stdout.flush()
+        
+        final_roots, first_nodes, correctness = [], [], []
+        
+        for i, res in enumerate(results):
+            final_root = dict_to_node(res["trace_tree"])
+            first_node = dict_to_node(res["first_generated_node"])
+            final_roots.append(final_root)
+            first_nodes.append(first_node)
+            
+            output_text = res.get("output", "")
+            status = res.get("status")
+            
+            if status == "SUCCESS" and len(output_text) < 8000:
+                try:
+                    is_correct = (self.score(output_text, problem) == 1.0)
+                except Exception as e:
+                    print(f"    [Warning] Math Scorer crashed on trace {i}: {e}")
+                    is_correct = False
+            else:
+                is_correct = False
+                
             correctness.append(is_correct)
 
-        # --- Step 2: Score and write group for root ---
-        self._write_group(roots, correctness, output_path, file_lock)
+        print("    [Debug] Scoring complete. Calculating lengths...")
+        sys.stdout.flush()
 
-        # --- Step 3: Pick reference trace ---
-        ref_idx = _pick_reference_index(roots, correctness, self.temperature)
-        ref_root = roots[ref_idx]
+        valid_lengths = []
+        for end_n, fn, c in zip(final_roots, first_nodes, correctness):
+            if c and _safe_verify_format(fn.output):
+                valid_lengths.append(_calculate_future_length(end_n, fn))
 
-        # =====================================================================
-        # EARLY STOP (ROOT LEVEL):
-        # If the chosen reference trace has a broken format, do not recurse.
-        # Continuing a tree based on bad formatting will only poison the dataset.
-        # =====================================================================
-        if not verify_output_format_strict(ref_root.output):
-            print("    [Early Stop] Reference root has invalid format. Aborting recursion for this problem.")
+        if valid_lengths:
+            avg_len = sum(valid_lengths) / len(valid_lengths)
+            print(f"    [Root Generation] Valid Future Lengths -> Max: {max(valid_lengths):.1f} | Min: {min(valid_lengths):.1f} | Avg: {avg_len:.2f}")
+        else:
+            print("    [Root Generation] No valid (correct + correct format) traces found for length tracking.")
+
+        self._write_group(final_roots, first_nodes, correctness, output_path, file_lock)
+
+        ref_idx = _pick_reference_index(final_roots, first_nodes, correctness, self.temperature)
+        ref_final_root = final_roots[ref_idx]
+        ref_first_node = first_nodes[ref_idx]
+        
+        has_subprobs = len(_ordered_nodes(ref_final_root)) > 1
+        ref_len = _calculate_future_length(ref_final_root, ref_first_node)
+        
+        print(f"    [Reference] Selected root index: {ref_idx} (correct: {correctness[ref_idx]}, length: {ref_len:.1f}, has_subproblems: {has_subprobs})")
+
+        if not correctness[ref_idx] or not _safe_verify_format(ref_first_node.output):
+            print("    [Early Stop] Reference trace is incorrect or has invalid format. Aborting recursion.")
             return
 
-        # --- Step 4: Walk reference trace and generate groups for each node ---
-        self._recurse_reference(ref_root, problem, engine, output_path, file_lock)
+        self._recurse_reference(ref_final_root, problem, engine, output_path, file_lock)
 
 
-    def _recurse_reference(
-        self,
-        ref_root: TreeTraceNode,
-        problem: Dict[str, Any],
-        engine: RecursiveEngine,
-        output_path: Path,
-        file_lock,
-    ):
-        """
-        Walk the reference trace in order and generate continuations, 
-        skipping any nodes that have formatting errors.
-        """
-        from abyme.utils import verify_output_format_strict
+    def _recurse_reference(self, ref_final_root: TreeTraceNode, problem: Dict[str, Any], engine: RecursiveEngine, output_path: Path, file_lock):
+        nodes_to_process = _ordered_nodes(ref_final_root)
+        print(f"    [Recursion] Ordered nodes to process: {len(nodes_to_process)} (will continue from {len(nodes_to_process) - 1} non-root nodes)")
 
-        nodes_to_process = _ordered_nodes(ref_root)
-
-        # Skip the very first node — already covered by generate_group's initial batch
-        for node in nodes_to_process[1:]:
+        for list_idx, node in enumerate(nodes_to_process[1:], start=1):
             
-            # =================================================================
-            # EARLY STOP (NODE LEVEL):
-            # Even if the root was okay, an intermediate node might be malformed.
-            # Don't waste 63 LLM calls branching off a broken state.
-            # =================================================================
-            if not verify_output_format_strict(node.output):
-                print(f"    [Early Stop] Node at depth {node.depth} has invalid format. Skipping its continuations.")
+            future_len = _calculate_future_length(ref_final_root, node)
+            
+            print(f"\n    {'-'*60}")
+            print(f"    >>> Continuing from Node #{list_idx}/{len(nodes_to_process)-1} (Depth: {node.depth}, Index: {node.index})")
+            print(f"    Main Problem  : {node.main_problem[:100]}..." if len(node.main_problem) > 100 else f"    Main Problem  : {node.main_problem}")
+            print(f"    Parent Problem: {node.parent_problem[:100]}..." if len(node.parent_problem) > 100 else f"    Parent Problem: {node.parent_problem}")
+            print(f"    Prompt        : {node.prompt[:100]}..." if len(node.prompt) > 100 else f"    Prompt        : {node.prompt}")
+            print(f"    Fragment      : {node.fragment[:100]}..." if len(node.fragment) > 100 else f"    Fragment      : {node.fragment}")
+            print(f"    Future Length : {future_len:.1f}")
+            print(f"    {'-'*60}")
+
+            if not _safe_verify_format(node.output):
+                print(f"    [Early Stop] Reference node at depth {node.depth} has invalid format or is too large. Skipping continuations.")
                 continue
                 
-            self._generate_and_write_node_group(node, problem, engine, output_path, file_lock)
+            self._generate_and_write_node_group(node, ref_final_root, problem, engine, output_path, file_lock)
 
-    def _generate_and_write_node_group(
-        self,
-        node: TreeTraceNode,
-        problem: Dict[str, Any],
-        engine: RecursiveEngine,
-        output_path: Path,
-        file_lock,
-    ):
-        import threading
-        from abyme.tree_trace import collect_all_nodes
 
-        # FIX 1: Generate 63 traces instead of 64
+    def _generate_and_write_node_group(self, node: TreeTraceNode, ref_final_root: TreeTraceNode, problem: Dict[str, Any], engine: RecursiveEngine, output_path: Path, file_lock):
         num_to_generate = self.group_size - 1
         source_nodes = [node] * num_to_generate
-        
         tmp_path = output_path.parent / f"_tmp_grpo_node_{id(threading.current_thread())}.jsonl"
+        
         try:
-            results = engine.continue_from_node(
-                source_nodes,
-                str(tmp_path),
-                group_size=num_to_generate,
-            )
+            results = engine.continue_from_node(source_nodes, str(tmp_path), group_size=num_to_generate)
         finally:
-            if tmp_path.exists():
-                tmp_path.unlink()
+            if tmp_path.exists(): 
+                try:
+                    tmp_path.unlink()
+                except Exception as e:
+                    pass
 
-        regen_nodes: List[TreeTraceNode] = []
-        correctness: List[bool] = []
-
-        for res in results:
-            regen_root = dict_to_node(res["trace_tree"])
+        final_roots, first_nodes, correctness = [], [], []
+        for i, res in enumerate(results):
+            final_root = dict_to_node(res["trace_tree"])
+            first_node = dict_to_node(res["first_generated_node"])
+            final_roots.append(final_root)
+            first_nodes.append(first_node)
             
-            # FIX 2: Use the robust state-matching search
-            regen_node = self._find_node_in_tree(regen_root, node)
-            if regen_node is None or not regen_node.output:
-                regen_node = regen_root # Fallback
-
-            regen_nodes.append(regen_node)
-            is_correct = (
-                res.get("status") == "SUCCESS"
-                and self.score(res.get("output", ""), problem) == 1.0
-            )
+            output_text = res.get("output", "")
+            status = res.get("status")
+            
+            if status == "SUCCESS" and len(output_text) < 8000:
+                try:
+                    is_correct = (self.score(output_text, problem) == 1.0)
+                except Exception:
+                    is_correct = False
+            else:
+                is_correct = False
+                
             correctness.append(is_correct)
 
-        # FIX 1 (Continued): Manually inject the known-good reference trace (+1)
-        regen_nodes.append(node)
-        correctness.append(True) # The reference trace was selected because it was correct
-
-        self._write_group(regen_nodes, correctness, output_path, file_lock)
-
-    def _find_node_in_tree(
-        self,
-        regen_root: TreeTraceNode,
-        original_node: TreeTraceNode,
-    ) -> Optional[TreeTraceNode]:
-        """
-        Robustly locate the regenerated equivalent of `original_node` inside `regen_root`
-        by matching the exact state signature (depth, prompt, fragment).
-        """
-        from abyme.tree_trace import collect_all_nodes
+        # Inject original reference trace
+        final_roots.append(ref_final_root)
+        first_nodes.append(node)
+        correctness.append(True) 
         
-        all_nodes = collect_all_nodes(regen_root)
-        for n in all_nodes:
-            if (n.depth == original_node.depth and 
-                n.prompt == original_node.prompt and 
-                n.fragment == original_node.fragment):
-                return n
-                
-        return None
+        valid_lengths = []
+        for end_n, fn, c in zip(final_roots, first_nodes, correctness):
+            if c and _safe_verify_format(fn.output):
+                valid_lengths.append(_calculate_future_length(end_n, fn))
 
-    def _write_group(
-        self,
-        nodes: List[TreeTraceNode],
-        correctness: List[bool],
-        output_path: Path,
-        file_lock,
-    ):
-        """Compute advantages and write {input, output, advantage} records."""
-        advantages = _compute_advantages(nodes, correctness, self.alpha)
+        if valid_lengths:
+            avg_len = sum(valid_lengths) / len(valid_lengths)
+            print(f"    [Node Generation] Valid Future Lengths -> Max: {max(valid_lengths):.1f} | Min: {min(valid_lengths):.1f} | Avg: {avg_len:.2f}")
+        else:
+            print("    [Node Generation] No valid (correct + format) traces found for length tracking.")
 
+        self._write_group(final_roots, first_nodes, correctness, output_path, file_lock)
+
+
+    def _write_group(self, final_roots: List[TreeTraceNode], first_nodes: List[TreeTraceNode], correctness: List[bool], output_path: Path, file_lock):
+        print("    [Debug] calling _compute_advantages...")
+        sys.stdout.flush()
+        advantages = _compute_advantages(final_roots, first_nodes, correctness, self.alpha)
+        
+        print("    [Debug] Writing group to disk...")
+        sys.stdout.flush()
         records = []
-        for node, advantage in zip(nodes, advantages):
-            if not node.output:
-                continue
+        for fn, advantage in zip(first_nodes, advantages):
+            if not fn.output: continue
             record = {
-                "input": magic_formatter(
-                    node.prompt,
-                    node.main_problem,
-                    node.parent_problem,
-                    node.fragment,
-                ),
-                "output": node.output,
+                "input": magic_formatter(fn.prompt, fn.main_problem, fn.parent_problem, fn.fragment),
+                "output": fn.output, 
                 "advantage": advantage,
             }
             records.append(record)
-
+            
         with file_lock:
             with output_path.open("a") as f:
                 for record in records:
                     f.write(json.dumps(record) + "\n")
+        print("    [Debug] File write complete.")
+        sys.stdout.flush()
 
-    # ------------------------------------------------------------------
-    # generate_all
-    # ------------------------------------------------------------------
-
-    def generate_all(
-        self,
-        model: LocalVLLMModel,
-        max_workers: int = 60,
-        **recursive_kwargs,
-    ):
-        """
-        Generate GRPO training data for all training problems.
-
-        Results are appended to results/grpo_{iteration}_train.jsonl as each
-        problem is processed.
-
-        Args:
-            model:          LocalVLLMModel to use for generation.
-            max_workers:    Shared thread-pool size for RecursiveEngine.
-            **recursive_kwargs: Passed to RecursiveEngine (max_depth, max_call, ...).
-        """
-        import threading
-
-        output_path = self.train_output_path
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("")  # clear
-
-        file_lock = threading.Lock()
-
-        engine = RecursiveEngine(
-            base_model=model,
-            max_workers=max_workers,
-            **recursive_kwargs,
-        )
-
-        print(f"\n{'='*60}")
-        print(f"GRPO GENERATION: iteration {self.iteration}")
-        print(f"{'='*60}")
-        print(f"Training problems : {len(self.train_data)}")
-        print(f"Group size        : {self.group_size}")
-        print(f"Output            : {output_path}")
-
-        for i, problem in enumerate(self.train_data):
-            print(f"  [{i+1}/{len(self.train_data)}] {problem.get('type','')} Level {problem.get('level_num','')}")
-            try:
-                self.generate_group(problem, engine, output_path, file_lock)
-            except Exception as e:
-                print(f"    ERROR: {e}")
-
-        print(f"\nGeneration complete. Saved to {output_path}")
-
-    # ------------------------------------------------------------------
-    # score_all
-    # ------------------------------------------------------------------
-
-    def score_all(
-        self,
-        model: LocalVLLMModel,
-        max_workers: int = 60,
-        **recursive_kwargs,
-    ) -> Tuple[float, List[float]]:
-        """
-        Run model on test set, score results, and save to JSONL.
-
-        Args:
-            model:       LocalVLLMModel to use.
-            max_workers: Shared thread-pool size.
-
-        Returns:
-            (avg_score, list_of_scores)
-        """
+    def score_all(self, model: LocalVLLMModel, test_data: List[Dict[str, Any]], iteration: int, max_workers: int = 60, **recursive_kwargs):
         from tqdm import tqdm
-
-        output_path = self.test_output_path
-        scored_path = self.test_scored_output_path
+        output_path = Path(f"results/grpo_{iteration}_test_results.jsonl")
+        scored_path = Path(f"results/grpo_{iteration}_test_scored.jsonl")
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n{'='*60}")
-        print(f"GRPO TESTING: iteration {self.iteration}")
-        print(f"{'='*60}")
-        print(f"Test samples : {len(self.test_data)}")
-
-        engine = RecursiveEngine(
-            base_model=model,
-            max_workers=max_workers,
-            **recursive_kwargs,
-        )
-
-        prompts = [item["problem"] for item in self.test_data]
+        engine = RecursiveEngine(base_model=model, max_workers=max_workers, **recursive_kwargs)
+        prompts = [item["problem"] for item in test_data]
         results = engine.process_batch(prompts, str(output_path))
 
-        # Augment with original problem metadata
-        augmented: List[Dict[str, Any]] = []
+        augmented = []
         for res in results:
             i = res["index"]
-            original = self.test_data[i]
+            original = test_data[i]
             augmented.append({
-                **res,
-                "problem_index": i,
-                "level_num": original["level_num"],
-                "type": original["type"],
-                "ground_truth": original.get("ground_truth", ""),
+                **res, "problem_index": i, "level_num": original["level_num"],
+                "type": original["type"], "ground_truth": original.get("ground_truth", "")
             })
-
         augmented.sort(key=lambda r: r["problem_index"])
+        
         with output_path.open("w") as f:
-            for rec in augmented:
-                f.write(json.dumps(rec) + "\n")
+            for rec in augmented: f.write(json.dumps(rec) + "\n")
 
-        # Score
         total = 0.0
-        scores: List[float] = []
+        scores = []
         with output_path.open("r") as infile, scored_path.open("w") as outfile:
-            lines = [l for l in infile if l.strip()]
-            for line in tqdm(lines, desc=f"Scoring iteration {self.iteration}"):
+            for line in tqdm([l for l in infile if l.strip()], desc=f"Scoring Iteration {iteration}"):
                 record = json.loads(line)
                 s = self.score(record.get("output", ""), record)
                 total += s
@@ -616,53 +459,5 @@ class DataManager(MATHFullBenchmark):
                 outfile.write(json.dumps({**record, "score": s}) + "\n")
 
         avg = total / len(scores) if scores else 0.0
-        print(f"Average score: {avg:.4f} ({int(total)}/{len(scores)} correct)")
+        print(f"Average score for Iteration {iteration}: {avg:.4f} ({int(total)}/{len(scores)} correct)")
         return avg, scores
-
-    def check_scores_by_level(self) -> Tuple[float, float, float, float, float, float]:
-        """Print and return per-level scores from the scored test output."""
-        return self._check_scores_from_path(
-            self.test_scored_output_path,
-            f"grpo_iteration_{self.iteration}",
-            level_field="level_num",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Quick smoke-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    base_model = "Lixing-Li/Abyme-Qwen3.5-9B-SFT"
-    iteration = 0
-    samples = (5, 5, 5, 5, 5)
-    tests = (5, 5, 5, 5, 5)
-
-    data_manager = DataManager(
-        iteration=iteration,
-        samples=samples,
-        tests=tests,
-        group_size=4,   # small for smoke-test
-        temperature=1.0,
-        alpha=1.0,
-    )
-
-    model = LocalVLLMModel(model_path=base_model)
-    print("Model loaded.")
-
-    data_manager.generate_all(
-        model=model,
-        max_workers=8,
-        max_depth=5,
-        max_call=50,
-        max_chain_length=5,
-    )
-
-    avg, _ = data_manager.score_all(
-        model=model,
-        max_workers=8,
-        max_depth=5,
-        max_call=50,
-        max_chain_length=5,
-    )
-    data_manager.check_scores_by_level()

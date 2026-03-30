@@ -2,10 +2,51 @@
 Tree Trace Module
 Handles the state, hierarchy, history, and metrics of the generation tree.
 """
+import threading
 from typing import List, Optional, Literal, Dict, Tuple, Callable, Any
 from abyme.utils import format_output, AND, OR, LEAF
 
 NodeStatus = Literal["WAIT_GEN", "GENERATING", "WAIT_SUB", "COMPLETED", "FINAL", "FAILED", "CANCELLED"]
+
+
+class CancelToken:
+    """
+    A lightweight cancellation signal that can abort an in-progress LLM call.
+
+    Usage:
+        token = CancelToken()
+        # Pass token to model.generate(prompt, cancel_token=token)
+        # From another thread, call token.cancel() to abort.
+    """
+
+    def __init__(self):
+        self._cancelled = threading.Event()
+        self._abort_fn = None
+        self._lock = threading.Lock()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def cancel(self):
+        """Signal cancellation and invoke the registered abort callback (if any)."""
+        self._cancelled.set()
+        with self._lock:
+            fn = self._abort_fn
+        if fn is not None:
+            fn()
+
+    def register_abort(self, fn):
+        """
+        Register a callback that aborts the in-progress request.
+        If already cancelled, the callback is invoked immediately.
+        Pass None to unregister.
+        """
+        with self._lock:
+            self._abort_fn = fn
+            already = self._cancelled.is_set()
+        if already and fn is not None:
+            fn()
 
 
 class TreeTraceNode:
@@ -29,7 +70,8 @@ class TreeTraceNode:
         self.type: str = LEAF  # AND, OR, or LEAF
         self.difficulty: int = 1
         self.is_cancelled: bool = False
-        
+        self.cancel_token: Optional[CancelToken] = None  # live token; not serialized
+
         self.output: str = ""
         self.error_message: str = ""
         self.latency: float = 0.0
@@ -70,6 +112,8 @@ class TreeTraceNode:
         """Mark this node and all its non-final descendants as cancelled (used by OR node kill switch)."""
         self.is_cancelled = True
         self.status = "CANCELLED"
+        if self.cancel_token is not None:
+            self.cancel_token.cancel()
         for sub in self.subproblems:
             if sub.status not in ["FINAL", "COMPLETED"]:
                 sub.cancel_tree()
@@ -428,14 +472,19 @@ def clone_trace_for_continuation(
             next_on_path = path[depth_in_path - 1]
             for sub in path_node.subproblems:
                 
-                # ---> THE FIX: Match by index, not memory id() <---
                 if sub.index == next_on_path.index:
-                    # Force the clone to follow our specific historical path_node,
-                    # effectively discarding any newer temporal continuations in this branch.
                     sub_clone = _clone_on_path(next_on_path, depth_in_path - 1, cloned)
                 else:
-                    # Sibling — preserve output so parent can inject it
                     sub_clone = deep_clone_subtree(sub, cloned)
+                    
+                    # --- THE RESURRECTION FIX ---
+                    # If the sibling was killed in the original run, we must resurrect it.
+                    # If the currently regenerating node succeeds, we will need this sibling to run!
+                    if sub_clone.status == "CANCELLED":
+                        sub_clone.status = "WAIT_GEN"
+                        sub_clone.is_cancelled = False
+                        sub_clone.output = ""
+                        sub_clone.subproblems = []
                 
                 cloned.subproblems.append(sub_clone)
 

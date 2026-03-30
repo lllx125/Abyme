@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, List, Dict, Any, Union
 
 from abyme.utils import verify_format
-from abyme.tree_trace import TreeTraceNode, length, to_dict, deep_clone_subtree, clone_trace_for_continuation
+from abyme.tree_trace import TreeTraceNode, CancelToken, length, to_dict, deep_clone_subtree, clone_trace_for_continuation
 from abyme.tree_trace import total_calls, max_depth, max_subproblems, max_output_character, parallel_latency
 from abyme.global_task_manager import GlobalTaskManager
 from abyme.model import Model, ErrorGuardModel
@@ -43,8 +43,8 @@ class RecursiveEngine(Model):
         self,
         base_model: Model,
         guard_model: Optional[Model] = None,
-        max_workers: int = 60,
-        max_depth: int = 20,
+        max_workers: int = 64,
+        max_depth: int = 5,
         max_call: int = 1000,
         max_subproblem_retry: int = 2,
         max_chain_length: int = 5,
@@ -77,9 +77,46 @@ class RecursiveEngine(Model):
         self.print_progress = print_progress
         self.print_lock = threading.Lock()
 
+        # Abort / cancellation support
+        self._abort_event = threading.Event()
+        self._active_tokens: List[CancelToken] = []
+        self._tokens_lock = threading.Lock()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def abort(self):
+        """
+        Immediately abort all in-progress generations and stop all workers.
+
+        Fires every active CancelToken (which propagates to vLLM engine.abort() calls)
+        and sets an internal shutdown event so worker threads exit at the next loop
+        boundary without waiting for LLM responses.
+
+        Safe to call from any thread at any time. After calling abort(), create a new
+        RecursiveEngine (or call reset()) before starting another run.
+        """
+        self._abort_event.set()
+        with self._tokens_lock:
+            tokens = list(self._active_tokens)
+        for token in tokens:
+            token.cancel()
+
+    def reset(self):
+        """Clear the abort flag so the engine can be reused after abort()."""
+        self._abort_event.clear()
+
+    def _register_token(self, token: CancelToken):
+        with self._tokens_lock:
+            self._active_tokens.append(token)
+
+    def _unregister_token(self, token: CancelToken):
+        with self._tokens_lock:
+            try:
+                self._active_tokens.remove(token)
+            except ValueError:
+                pass
 
     def generate(self, prompt: str, max_attempt: int = 1) -> str:
         """
@@ -97,11 +134,8 @@ class RecursiveEngine(Model):
         tree_id = "single"
         root = TreeTraceNode(prompt=prompt, fragment="", index=0)
 
-        manager = GlobalTaskManager(
-            max_call=self.max_call,
-            proceed_when_fail=self.proceed_when_fail
-        )
-        manager.register_tree(tree_id, root)
+        manager = GlobalTaskManager(proceed_when_fail=self.proceed_when_fail)
+        manager.register_tree(tree_id, root, max_call=self.max_call)
 
         self._run_pool(manager, max_attempt, wait_for=tree_id)
 
@@ -120,7 +154,7 @@ class RecursiveEngine(Model):
         Process a list of prompts with a shared worker pool.
 
         Results are written to output_jsonl_path as each tree finishes (streaming).
-        Each line contains: index, prompt, status, output, metrics, trace_tree.
+        Each line contains: index, prompt, status, output, metrics, trace_tree, first_generated_node.
 
         Args:
             prompts: Input prompts
@@ -140,14 +174,11 @@ class RecursiveEngine(Model):
 
         print(f"Batch: {len(prompts)} prompts | {self.max_workers} shared workers | max_call={self.max_call}")
 
-        manager = GlobalTaskManager(
-            max_call=self.max_call,
-            proceed_when_fail=self.proceed_when_fail
-        )
+        manager = GlobalTaskManager(proceed_when_fail=self.proceed_when_fail)
 
         for i, prompt in enumerate(prompts):
             root = TreeTraceNode(prompt=prompt, fragment="", index=0)
-            manager.register_tree(f"tree_{i}", root)
+            manager.register_tree(f"tree_{i}", root, max_call=self.max_call)
 
         # Launch worker pool in background threads
         completed_count = [0]  # mutable int in closure
@@ -159,13 +190,16 @@ class RecursiveEngine(Model):
                 with output_path.open('a') as f:
                     f.write(json.dumps(result) + '\n')
             completed_count[0] += 1
-            status = "OK" if root.status == "FINAL" else "FAIL"
-            print(f"  [{completed_count[0]}/{len(prompts)}] {status} tree_{idx}")
+            status = "✅" if root.status == "FINAL" else "❌"
+            print(f"  [{completed_count[0]}/{len(prompts)}] {status} tree_{idx} in {parallel_latency(root):.3f}s")
 
-        # Watcher thread: fires on_tree_done as each tree's Event becomes set
+        # Watcher thread: fires on_tree_done as each tree's Event becomes set.
+        # Clears tree_done_event before polling so a completion that races with
+        # the poll is never missed — worst case we loop one extra time.
         def watcher():
             pending = list(range(len(prompts)))
             while pending:
+                manager.tree_done_event.clear()
                 still_pending = []
                 for idx in pending:
                     tid = f"tree_{idx}"
@@ -175,9 +209,7 @@ class RecursiveEngine(Model):
                         still_pending.append(idx)
                 pending = still_pending
                 if pending:
-                    # Wait for any notification rather than busy-spinning
-                    with manager.global_lock:
-                        manager.worker_condition.wait(timeout=0.2)
+                    manager.wait_for_any_tree_done(timeout=0.5)
 
         watcher_thread = threading.Thread(target=watcher, daemon=True)
         watcher_thread.start()
@@ -211,14 +243,6 @@ class RecursiveEngine(Model):
         available) until the root reaches FINAL.  The original traces are
         never modified.
 
-        General case (source_node with non-empty past):
-            The node's prompt, fragment, and past chain are preserved so the
-            model sees its full temporal context.  Its output and subproblems
-            are cleared.  Ancestor nodes are restored to WAIT_SUB with their
-            original outputs intact (needed to reconstruct sibling subproblem
-            prompts).  Completed siblings are deep-cloned as-is so their
-            outputs are injected when the parent continues.
-
         Batch processing:
             source_nodes are processed in groups of group_size, each group
             sharing one worker pool.  Results stream to output_jsonl_path as
@@ -251,10 +275,7 @@ class RecursiveEngine(Model):
         for group_start in range(0, len(source_nodes), group_size):
             group = source_nodes[group_start : group_start + group_size]
 
-            manager = GlobalTaskManager(
-                max_call=self.max_call,
-                proceed_when_fail=self.proceed_when_fail,
-            )
+            manager = GlobalTaskManager(proceed_when_fail=self.proceed_when_fail)
 
             # Build (tree_id -> original source_node) map for this group
             source_map: Dict[str, TreeTraceNode] = {}
@@ -262,7 +283,7 @@ class RecursiveEngine(Model):
                 global_idx = group_start + local_idx
                 tree_id = f"continue_{global_idx}"
                 cloned_root, _ = clone_trace_for_continuation(src)
-                manager.register_tree(tree_id, cloned_root)
+                manager.register_tree(tree_id, cloned_root, max_call=self.max_call)
                 source_map[tree_id] = src
 
             def on_tree_done(tree_id: str, global_idx: int, src: TreeTraceNode):
@@ -273,12 +294,13 @@ class RecursiveEngine(Model):
                         f.write(json.dumps(result) + "\n")
                     all_results.append(result)
                 completed_count[0] += 1
-                status = "OK" if root.status == "FINAL" else "FAIL"
+                status = "✅" if root.status == "FINAL" else "❌"
                 print(f"  [{completed_count[0]}/{len(source_nodes)}] {status} continue_{global_idx}")
 
             def watcher():
                 pending = list(range(len(group)))
                 while pending:
+                    manager.tree_done_event.clear()
                     still_pending = []
                     for local_idx in pending:
                         global_idx = group_start + local_idx
@@ -289,8 +311,7 @@ class RecursiveEngine(Model):
                             still_pending.append(local_idx)
                     pending = still_pending
                     if pending:
-                        with manager.global_lock:
-                            manager.worker_condition.wait(timeout=0.2)
+                        manager.wait_for_any_tree_done(timeout=0.5)
 
             watcher_thread = threading.Thread(target=watcher, daemon=True)
             watcher_thread.start()
@@ -301,6 +322,64 @@ class RecursiveEngine(Model):
 
         all_results.sort(key=lambda r: r["index"])
         return all_results
+
+    # ------------------------------------------------------------------
+    # Internal machinery
+    # ------------------------------------------------------------------
+
+    def _extract_first_generated_node(self, final_root: TreeTraceNode, source_node: Optional[TreeTraceNode] = None) -> Dict[str, Any]:
+        """
+        Navigates the temporal/spatial graph to locate the exact node state 
+        that was FIRST generated during the current engine session.
+        """
+        if source_node is None:
+            # Initial generation from absolute root
+            target = final_root
+            initial_past_len = 0
+        else:
+            # We must re-navigate from final_root down to the continued node
+            path_indices = []
+            curr = source_node
+            while curr.parent is not None:
+                path_indices.append(curr.index)
+                curr = curr.parent
+            path_indices.reverse()
+            
+            target = final_root
+            for idx in path_indices:
+                target = target.subproblems[idx]
+            
+            # The length of the past array before this session began
+            initial_past_len = len(source_node.past)
+            
+        # The first state generated in this session will be the one appended right after the initial_past_len
+        if len(target.past) > initial_past_len:
+            first_node = target.past[initial_past_len]
+        else:
+            first_node = target
+            
+        return to_dict(first_node)
+
+    def _build_result(self, idx: int, prompt: str, root: TreeTraceNode) -> Dict[str, Any]:
+        """Build the JSONL result dict for one completed tree."""
+        is_success = root.status == "FINAL"
+        return {
+            "index": idx,
+            "prompt": prompt,
+            "status": "SUCCESS" if is_success else "FAILED",
+            "output": root.get_final_output() if is_success else "",
+            "error": None if is_success else root.error_message,
+            "metrics": {
+                "total_llm_calls": total_calls(root),
+                "max_tree_depth": max_depth(root),
+                "max_subproblems": max_subproblems(root),
+                "max_output_chars": max_output_character(root),
+                "theoretical_parallel_latency": parallel_latency(root),
+                "length": length(root)
+            },
+            "trace_tree": to_dict(root),
+            "first_generated_node": self._extract_first_generated_node(root, source_node=None)
+        }
 
     def _build_continuation_result(
         self, idx: int, source_node: TreeTraceNode, root: TreeTraceNode
@@ -322,11 +401,8 @@ class RecursiveEngine(Model):
                 "length": length(root),
             },
             "trace_tree": to_dict(root),
+            "first_generated_node": self._extract_first_generated_node(root, source_node=source_node)
         }
-
-    # ------------------------------------------------------------------
-    # Internal machinery
-    # ------------------------------------------------------------------
 
     def _run_pool(
         self,
@@ -336,11 +412,6 @@ class RecursiveEngine(Model):
     ):
         """
         Launch the shared ThreadPoolExecutor and block until done.
-
-        Args:
-            manager: GlobalTaskManager that owns all trees
-            max_attempt: Retry attempts passed to _guarded_generate
-            wait_for: tree_id to wait for (None = wait for all trees)
         """
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             for _ in range(self.max_workers):
@@ -361,14 +432,14 @@ class RecursiveEngine(Model):
         """
         while True:
             with manager.global_lock:
-                if manager.all_finished:
+                if manager.all_finished or self._abort_event.is_set():
                     break
 
             task_info = manager.get_next_task()
 
             if task_info is None:
                 with manager.global_lock:
-                    if manager.all_finished:
+                    if manager.all_finished or self._abort_event.is_set():
                         break
                     manager.worker_condition.wait(timeout=0.5)
                 continue
@@ -392,11 +463,10 @@ class RecursiveEngine(Model):
         """
         Format prompt, enforce depth limits, call model, validate output.
 
-        Returns:
-            (output_str, latency_seconds)
-
-        Raises:
-            Exception if all attempts fail
+        Creates a CancelToken for this generation attempt and attaches it to
+        the node.  If the node (or its tree) is cancelled mid-generation the
+        token fires engine.abort() on the vLLM side so the worker thread
+        unblocks quickly instead of waiting for the full LLM response.
         """
         active_model = self.base_model
         if node.depth >= self.max_depth or len(node.past) >= self.max_chain_length:
@@ -410,43 +480,38 @@ class RecursiveEngine(Model):
             node.fragment
         )
 
-        last_error = None
-        for _ in range(max_attempt):
-            try:
-                start = time.time()
-                response = active_model.generate(formatted_prompt, max_attempt=1)
-                latency = time.time() - start
+        token = CancelToken()
+        node.cancel_token = token
+        self._register_token(token)
 
-                if not verify_format(response):
-                    raise ValueError("Invalid format in response")
+        try:
+            last_error = None
+            for _ in range(max_attempt):
+                if token.is_cancelled:
+                    raise Exception("Node cancelled before generation attempt")
+                try:
+                    start = time.time()
+                    # Pass cancel_token when the model supports it (LocalVLLMModel does;
+                    # other models ignore the extra kwarg or we fall back gracefully).
+                    try:
+                        response = active_model.generate(formatted_prompt, max_attempt=1, cancel_token=token)
+                    except TypeError:
+                        response = active_model.generate(formatted_prompt, max_attempt=1)
+                    latency = time.time() - start
 
-                if self.print_progress:
-                    with self.print_lock:
-                        print(f"  depth={node.depth} lat={latency:.2f}s | {node.prompt[:80]}")
+                    if not verify_format(response):
+                        raise ValueError("Invalid format in response")
 
-                return response, latency
+                    if self.print_progress:
+                        with self.print_lock:
+                            print(f"  depth={node.depth} lat={latency:.2f}s | {node.prompt[:80]}")
 
-            except Exception as e:
-                last_error = e
+                    return response, latency
 
-        raise Exception(f"All {max_attempt} attempts failed. Last: {last_error}")
+                except Exception as e:
+                    last_error = e
 
-    def _build_result(self, idx: int, prompt: str, root: TreeTraceNode) -> Dict[str, Any]:
-        """Build the JSONL result dict for one completed tree."""
-        is_success = root.status == "FINAL"
-        return {
-            "index": idx,
-            "prompt": prompt,
-            "status": "SUCCESS" if is_success else "FAILED",
-            "output": root.get_final_output() if is_success else "",
-            "error": None if is_success else root.error_message,
-            "metrics": {
-                "total_llm_calls": total_calls(root),
-                "max_tree_depth": max_depth(root),
-                "max_subproblems": max_subproblems(root),
-                "max_output_chars": max_output_character(root),
-                "theoretical_parallel_latency": parallel_latency(root),
-                "length": length(root)
-            },
-            "trace_tree": to_dict(root)
-        }
+            raise Exception(f"All {max_attempt} attempts failed. Last: {last_error}")
+        finally:
+            node.cancel_token = None
+            self._unregister_token(token)

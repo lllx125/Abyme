@@ -1,10 +1,10 @@
+from unsloth import FastLanguageModel, is_bfloat16_supported
 import os
 import gc
 import torch
 import dotenv
 from datasets import load_dataset
 from transformers import AutoTokenizer, TrainingArguments, Trainer, DataCollatorForSeq2Seq
-from unsloth import FastLanguageModel, is_bfloat16_supported
 from abyme.magic import abyme_system_prompt
 
 dotenv.load_dotenv()
@@ -14,8 +14,8 @@ dotenv.load_dotenv()
 # ==========================================
 LORA_RANK = 64
 LORA_ALPHA = 128
-BATCH_SIZE = 2
-GRADIENT_ACCUMULATION_STEPS = 32  # 2 * 32 = 64 effective batch size
+BATCH_SIZE = 1
+GRADIENT_ACCUMULATION_STEPS = 64  # 1 * 64 = 64 effective batch size
 LEARNING_RATE = 2e-6              # RL requires lower learning rates than SFT
 NUM_EPOCHS = 1
 BETA = 0.04                       # KL Divergence Penalty coefficient
@@ -32,60 +32,70 @@ class OfflineGRPOTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
-        Custom Policy Gradient loss using pre-computed advantages and 
+        Custom Policy Gradient loss using pre-computed advantages and
         on-the-fly KL penalty via adapter toggling.
+
+        Memory layout: reference pass runs FIRST so its logit tensor is freed
+        before the policy forward allocates its (grad-tracked) logit tensor.
+        This avoids holding two full (batch x seq x vocab) tensors simultaneously,
+        which was the cause of OOM on long-sequence batches.
         """
-        # 1. Extract Advantages (Convert to tensor if not already)
+        # 1. Extract Advantages
         advantages = inputs.pop("advantages")
         if not isinstance(advantages, torch.Tensor):
             advantages = torch.tensor(advantages, dtype=torch.float32)
         advantages = advantages.to(model.device)
 
         labels = inputs["labels"]
-        
-        # 2. Forward pass for Policy Model (pi_theta)
-        outputs = model(**inputs)
-        logits = outputs.logits
-        
-        # 3. Forward pass for Reference Model (pi_ref) - VRAM SAVER TRICK
+        shift_labels = labels[..., 1:].contiguous()
+        mask = (shift_labels != -100)
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+
+        # 2. Reference pass FIRST (no_grad) — free logits immediately after
+        #    computing log-probs so VRAM is clear for the policy forward pass.
         with model.disable_adapter():
             with torch.no_grad():
-                ref_outputs = model(**inputs)
-                ref_logits = ref_outputs.logits
+                ref_logits = model(**inputs).logits
+                shift_ref_logits = ref_logits[..., :-1, :].contiguous()
+                del ref_logits
+                ref_token_nll = loss_fct(
+                    shift_ref_logits.view(-1, shift_ref_logits.size(-1)),
+                    shift_labels.view(-1),
+                ).view(shift_labels.size())
+                del shift_ref_logits
+                log_pi_ref = -(ref_token_nll * mask).sum(dim=1)
+                del ref_token_nll
 
-        # 4. Shift logits and labels for next-token prediction
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_ref_logits = ref_logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        # 3. Policy pass (with grad) — ref logits are already freed
+        policy_logits = model(**inputs).logits
+        shift_logits = policy_logits[..., :-1, :].contiguous()
+        del policy_logits
+        token_nll = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        ).view(shift_labels.size())
+        # shift_logits kept alive — autograd needs it for backward
 
-        # 5. Calculate per-token Log Probabilities
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        
-        token_nll = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        token_nll = token_nll.view(shift_labels.size())
-        
-        ref_token_nll = loss_fct(shift_ref_logits.view(-1, shift_ref_logits.size(-1)), shift_labels.view(-1))
-        ref_token_nll = ref_token_nll.view(shift_labels.size())
-
-        # Mask out padding (-100)
-        mask = (shift_labels != -100)
-        
-        # Sum over sequence length (dim=1) to get full sequence log probability
+        # 4. Sequence log-probabilities
         log_pi_theta = -(token_nll * mask).sum(dim=1)
-        log_pi_ref = -(ref_token_nll * mask).sum(dim=1)
+        del token_nll
 
-        # 6. Calculate Clipped GRPO/PPO Objective
-        ratio = torch.exp(log_pi_theta - log_pi_ref)
+        # 5. Clipped GRPO/PPO Objective
+        ratio = torch.exp(log_pi_theta - log_pi_ref.detach())
         clipped_ratio = torch.clamp(ratio, 1.0 - 0.2, 1.0 + 0.2)
         policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
 
-        # 7. Calculate Exact KL Divergence (Approximate PPO style)
-        kl = torch.exp(log_pi_ref - log_pi_theta) - (log_pi_ref - log_pi_theta) - 1.0
+        # 6. KL Divergence penalty (approximate PPO style)
+        kl = (
+            torch.exp(log_pi_ref.detach() - log_pi_theta)
+            - (log_pi_ref.detach() - log_pi_theta)
+            - 1.0
+        )
 
-        # 8. Total Loss
+        # 7. Total Loss
         loss = (policy_loss + self.beta * kl).mean()
 
-        return (loss, outputs) if return_outputs else loss
+        return loss
 
 
 # ==========================================
@@ -96,14 +106,23 @@ def run_training(base_model_path: str, local_jsonl_path: str, output_adapter_dir
     Trains the LoRA adapters on the offline GRPO data and saves them locally.
     Does NOT push to hub.
     """
+    # Prevent fragmentation: allows the allocator to grow existing segments instead
+    # of failing when free memory is split into non-contiguous chunks.
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
     print(f"Loading base model: {base_model_path}")
-    
-    model, tokenizer = FastLanguageModel.from_pretrained(
+
+    # NOTE: Unsloth might return a Vision-Language Processor instead of a simple tokenizer
+    model, processor = FastLanguageModel.from_pretrained(
         model_name=base_model_path,
         max_seq_length=MAX_SEQ_LENGTH,
         dtype=None,          
         load_in_4bit=False,   
     )
+
+    # CRITICAL FIX: Extract the raw text tokenizer immediately to prevent 2D array nesting
+    # and PIL image parsing errors during the mapping phase.
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
     # Add LoRA Adapters
     model = FastLanguageModel.get_peft_model(
@@ -120,10 +139,10 @@ def run_training(base_model_path: str, local_jsonl_path: str, output_adapter_dir
     
     if resume and os.path.exists(output_adapter_dir):
         print(f"Resuming training from existing adapter: {output_adapter_dir}")
-        model.load_adapter(output_adapter_dir)
+        model.load_adapter(output_adapter_dir, adapter_name="default")
         # Ensure it remains trainable
-        for param in model.parameters():
-            if param.requires_grad is False and "lora" in param.name: # Only set LoRA layers
+        for name, param in model.named_parameters():
+            if not param.requires_grad and "lora" in name:
                 param.requires_grad = True
 
     print(f"Loading local dataset: {local_jsonl_path}")
@@ -147,13 +166,25 @@ def run_training(base_model_path: str, local_jsonl_path: str, output_adapter_dir
             
         full_text = prompt_str + completion_str
         
-        # Tokenize full text
-        encoded = tokenizer(full_text, truncation=True, max_length=MAX_SEQ_LENGTH, padding=False)
-        # Tokenize prompt to find the masking boundary
-        prompt_encoded = tokenizer(prompt_str, truncation=True, max_length=MAX_SEQ_LENGTH, padding=False)
+        # Tokenize explicitly as text
+        encoded = tokenizer(text=full_text, truncation=True, max_length=MAX_SEQ_LENGTH, padding=False)
+        prompt_encoded = tokenizer(text=prompt_str, truncation=True, max_length=MAX_SEQ_LENGTH, padding=False)
+        
+        # --- THE FIX: BULLETPROOF 1D LIST EXTRACTION ---
+        # If the VL tokenizer nested our tokens, extract the inner list
+        input_ids = encoded["input_ids"]
+        if len(input_ids) > 0 and isinstance(input_ids[0], list):
+            encoded["input_ids"] = input_ids[0]
+            if "attention_mask" in encoded:
+                encoded["attention_mask"] = encoded["attention_mask"][0]
+                
+        prompt_input_ids = prompt_encoded["input_ids"]
+        if len(prompt_input_ids) > 0 and isinstance(prompt_input_ids[0], list):
+            prompt_input_ids = prompt_input_ids[0]
+        # ------------------------------------------------
         
         labels = encoded["input_ids"].copy()
-        prompt_len = len(prompt_encoded["input_ids"])
+        prompt_len = len(prompt_input_ids)
         
         # Mask the prompt so we only compute loss on the generation
         labels[:prompt_len] = [-100] * prompt_len
@@ -198,14 +229,18 @@ def run_training(base_model_path: str, local_jsonl_path: str, output_adapter_dir
     # Train & Save Locally
     # ----------------------------------------------------
     print("Starting Offline GRPO Training...")
+    
+    os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
+    
     trainer.train()
 
     print(f"Training complete! Saving LoRA adapters to {output_adapter_dir}")
     model.save_pretrained(output_adapter_dir)
-    tokenizer.save_pretrained(output_adapter_dir)
+    # Save the original processor so inference code downstream doesn't break
+    processor.save_pretrained(output_adapter_dir) 
 
     # Free memory
-    del trainer, model, tokenizer
+    del trainer, model, tokenizer, processor
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -225,31 +260,27 @@ def merge_and_upload(base_model_path: str, lora_adapter_dir: str, hub_repo_id: s
 
     print(f"Merging LoRA adapters from {lora_adapter_dir} into base model {base_model_path}...")
     
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=base_model_path,
+    # Load directly from the adapter directory — it contains adapter_config.json
+    # which points back to the base model. Unsloth auto-detects this and returns
+    # a properly patched PeftModel that push_to_hub_merged will accept.
+    model, processor = FastLanguageModel.from_pretrained(
+        model_name=lora_adapter_dir,
         max_seq_length=MAX_SEQ_LENGTH,
         dtype=None,
         load_in_4bit=False,
     )
 
-    # Load the locally saved adapters onto the base model
-    model.load_adapter(lora_adapter_dir)
-
     print(f"Pushing merged model to Hugging Face Hub: {hub_repo_id}")
     model.push_to_hub_merged(
         hub_repo_id,
-        tokenizer=tokenizer,
+        tokenizer=processor, # push_to_hub_merged expects the tokenizer kwarg, but handles processors fine
         save_method="merged_16bit",
         token=HF_TOKEN,
     )
 
-    # Push a clean tokenizer to avoid unsloth backend warnings
-    clean_tokenizer = AutoTokenizer.from_pretrained(hub_repo_id, token=HF_TOKEN)
-    clean_tokenizer.push_to_hub(hub_repo_id, token=HF_TOKEN)
-
     print(f"Success! Model uploaded to: https://huggingface.co/{hub_repo_id}")
 
-    del model, tokenizer, clean_tokenizer
+    del model, processor
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -270,10 +301,3 @@ if __name__ == "__main__":
         local_jsonl_path=LOCAL_DATA,
         output_adapter_dir=ADAPTER_OUTPUT_DIR
     )
-
-    # Step 2: Merge and upload (Call this every N iterations)
-    # merge_and_upload(
-    #     base_model_path=BASE_MODEL,
-    #     lora_adapter_dir=ADAPTER_OUTPUT_DIR,
-    #     hub_repo_id=HUB_REPO
-    # )

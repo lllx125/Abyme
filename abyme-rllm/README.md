@@ -84,6 +84,78 @@ cd ..
 
 Then open http://localhost:5000 in your browser.
 
+## Cancellation & Abort
+
+### Why it exists
+
+When an OR-node tree completes (one child succeeds and siblings are cancelled), worker
+threads that are already mid-LLM-call for those cancelled siblings would previously
+block until the full response arrived before exiting.  With 64 workers and a 9 B model
+this caused a long stall between the last `✅ tree_N` print and `process_batch` returning.
+
+The fix adds a `CancelToken` that is attached to each node while it is being generated.
+`cancel_tree()` now fires the token, which calls `engine.abort(request_id)` on the vLLM
+side to kill the request mid-stream.  Workers unblock immediately.
+
+### Per-node cancellation (automatic)
+
+No user action required.  Whenever `cancel_tree()` is called (OR kill-switch, max_call
+enforcement, etc.) the in-progress vLLM request for that node is aborted automatically.
+
+### External abort (manual)
+
+Call `engine.abort()` from any thread to stop an entire batch immediately:
+
+```python
+import threading
+from abyme import RecursiveEngine
+from abyme.vllm_model import LocalVLLMModel
+
+model = LocalVLLMModel("path/to/model")
+engine = RecursiveEngine(base_model=model, max_workers=64)
+
+# Start a batch in a background thread
+t = threading.Thread(target=engine.process_batch, args=(prompts, "out.jsonl"))
+t.start()
+
+# ...later, abort everything:
+engine.abort()
+t.join()
+
+# If you want to reuse the engine after aborting:
+engine.reset()
+```
+
+`abort()` does three things:
+1. Sets an internal shutdown event — workers exit at the next loop boundary.
+2. Fires every active `CancelToken` — any mid-stream vLLM request is aborted via
+   `engine.abort(request_id)`.
+3. Is idempotent and thread-safe.
+
+### Using CancelToken directly (advanced)
+
+`CancelToken` is a plain object you can create and pass to `LocalVLLMModel.generate`
+if you need fine-grained control outside the engine:
+
+```python
+from abyme import CancelToken
+from abyme.vllm_model import LocalVLLMModel
+
+model = LocalVLLMModel("path/to/model")
+token = CancelToken()
+
+# generate in a thread, cancel from the main thread
+import threading
+result = []
+t = threading.Thread(target=lambda: result.append(
+    model.generate("some prompt", cancel_token=token)
+))
+t.start()
+
+token.cancel()   # aborts the vLLM request immediately
+t.join()
+```
+
 ## License
 
 MIT License

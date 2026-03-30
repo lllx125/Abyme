@@ -19,10 +19,14 @@ class TreeManager:
         root: TreeTraceNode,
         proceed_when_fail: bool = True,
         shared_lock: Optional[threading.RLock] = None,
-        shared_condition: Optional[threading.Condition] = None
+        shared_condition: Optional[threading.Condition] = None,
+        max_call: int = 1000
     ):
         self.root: TreeTraceNode = root
         self.proceed_when_fail: bool = proceed_when_fail
+
+        self.max_call: int = max_call
+        self.call_count: int = 0
 
         # Use provided shared lock (from GlobalTaskManager) or create a private one.
         # Sharing the lock with GlobalTaskManager avoids cross-lock deadlocks.
@@ -174,82 +178,79 @@ class TreeManager:
             self.is_finished = True
             return
 
-        # ----------------------------------------------------
-        # SCENARIO A: A Child Succeeded (FINAL)
-        # ----------------------------------------------------
-        if child_node.status == "FINAL":
-            if parent.type == AND:
-                if all(sub.status == "FINAL" for sub in parent.subproblems):
-                    parent.status = "COMPLETED"
-                    # Inject ONLY the string after </think>
-                    responses = [sub.get_final_output() for sub in parent.subproblems]
-                    reconstructed = replace_delegations_with_responses(parent.output, responses, tag=AND)
-                    
-                    new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
-                    if parent == self.root: self.root = new_node
-                    self.worker_condition.notify_all()
-                    
-            elif parent.type == OR:
-                parent.status = "COMPLETED"
-                for sub in parent.subproblems:
-                    if sub != child_node and sub.status not in ["FINAL", "COMPLETED"]:
-                        sub.cancel_tree()
-                
-                responses = []
-                for sub in parent.subproblems:
-                    if sub.status == "FINAL":
-                        responses.append(sub.get_final_output())
-                    elif sub.status == "FAILED":
-                        # FIX: Remove sub.fragment to prevent context explosion
-                        responses.append(f"FAILED\n{sub.output}")
-                    elif sub.is_cancelled:
-                        responses.append("CANCELLED")
-                        
-                reconstructed = replace_delegations_with_responses(parent.output, responses, tag=OR)
-                new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
-                if parent == self.root: self.root = new_node
-                self.worker_condition.notify_all()
+        from .utils import AND, OR, replace_delegations_with_responses
 
-        # ----------------------------------------------------
-        # SCENARIO B: A Child Failed (FAILED)
-        # ----------------------------------------------------
-        elif child_node.status == "FAILED":
-            if parent.type == AND:
-                for sub in parent.subproblems:
-                    if sub != child_node and sub.status not in ["FINAL", "COMPLETED"]:
-                        sub.cancel_tree()
+        # --- 1. EARLY KILL SWITCHES ---
+        if child_node.status == "FAILED" and parent.type == AND:
+            # One failure dooms the AND node. Cancel others.
+            for sub in parent.subproblems:
+                if sub != child_node and sub.status not in ["FINAL", "COMPLETED"]:
+                    sub.cancel_tree()
+                    
+        elif child_node.status == "FINAL" and parent.type == OR:
+            # One success fulfills the OR node. Cancel others.
+            for sub in parent.subproblems:
+                if sub != child_node and sub.status not in ["FINAL", "COMPLETED"]:
+                    sub.cancel_tree()
 
+        # --- 2. WAIT FOR ALL SIBLINGS ---
+        active_siblings = any(
+            sub.status in ["WAIT_GEN", "GENERATING", "WAIT_SUB"] 
+            for sub in parent.subproblems
+        )
+        
+        if active_siblings:
+            # Wait for the other siblings to finish or be cancelled
+            return
+
+        # --- 3. RESOLVE PARENT OUTCOME ---
+        if parent.type == AND:
+            if any(sub.status == "FAILED" for sub in parent.subproblems) or any(sub.status == "CANCELLED" for sub in parent.subproblems):
                 if self.proceed_when_fail:
                     parent.status = "COMPLETED"
                     responses = []
                     for sub in parent.subproblems:
-                        if sub.status == "FINAL":
-                            responses.append(sub.get_final_output())
-                        elif sub.status == "FAILED":
-                            # FIX: Inject only output
-                            responses.append(f"FAILED\n{sub.output}")
-                        else:
-                            responses.append("CANCELLED")
-                            
+                        if sub.status == "FINAL": responses.append(sub.get_final_output())
+                        elif sub.status == "FAILED": responses.append(f"FAILED\n{sub.output}")
+                        else: responses.append("CANCELLED")
                     reconstructed = replace_delegations_with_responses(parent.output, responses, tag=AND)
                     new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
                     if parent == self.root: self.root = new_node
                 else:
                     parent.status = "FAILED"
-                    parent.error_message = f"Subproblem {child_node.index} failed: {child_node.error_message}"
+                    parent.error_message = f"A subproblem failed or was cancelled."
                     self._resolve_parent(parent)
-                    
-            elif parent.type == OR:
-                if all(sub.status == "FAILED" for sub in parent.subproblems):
-                    if self.proceed_when_fail:
-                        parent.status = "COMPLETED"
-                        # FIX: Inject only output for all failed attempts
-                        responses = [f"FAILED\n{sub.output}" for sub in parent.subproblems]
-                        reconstructed = replace_delegations_with_responses(parent.output, responses, tag=OR)
-                        
-                        new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
-                        if parent == self.root: self.root = new_node
-                    else:
-                        parent.status = "FAILED"
-                        parent.error_message = "All attempted approaches failed."
-                        self._resolve_parent(parent)
+            else:
+                # All must be FINAL
+                parent.status = "COMPLETED"
+                responses = [sub.get_final_output() for sub in parent.subproblems]
+                reconstructed = replace_delegations_with_responses(parent.output, responses, tag=AND)
+                new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
+                if parent == self.root: self.root = new_node
+                
+        elif parent.type == OR:
+            if any(sub.status == "FINAL" for sub in parent.subproblems):
+                parent.status = "COMPLETED"
+                responses = []
+                for sub in parent.subproblems:
+                    if sub.status == "FINAL": responses.append(sub.get_final_output())
+                    elif sub.status == "FAILED": responses.append(f"FAILED\n{sub.output}")
+                    else: responses.append("CANCELLED")
+                reconstructed = replace_delegations_with_responses(parent.output, responses, tag=OR)
+                new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
+                if parent == self.root: self.root = new_node
+            else:
+                # All failed or cancelled
+                if self.proceed_when_fail:
+                    parent.status = "COMPLETED"
+                    responses = []
+                    for sub in parent.subproblems:
+                        if sub.status == "FAILED": responses.append(f"FAILED\n{sub.output}")
+                        else: responses.append("CANCELLED")
+                    reconstructed = replace_delegations_with_responses(parent.output, responses, tag=OR)
+                    new_node = parent.continue_generation(parent.fragment + "\n\n" + reconstructed)
+                    if parent == self.root: self.root = new_node
+                else:
+                    parent.status = "FAILED"
+                    parent.error_message = "All attempted approaches failed."
+                    self._resolve_parent(parent)

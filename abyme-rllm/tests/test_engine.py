@@ -5,6 +5,10 @@ Tests the core RecursiveEngine, continue_from_node, and analyzes trace lengths.
 import os
 import json
 import statistics
+from collections import Counter
+import matplotlib.pyplot as plt
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), "../../.env"))
 from abyme.vllm_model import LocalVLLMModel
 from abyme.recursive_engine import RecursiveEngine
 from abyme.tree_trace import dict_to_node, length
@@ -32,18 +36,33 @@ def analyze_length_distribution(jsonl_path: str):
         print(f"Std Dev    : {statistics.stdev(lengths):.2f} chars")
     print("-" * 50)
 
+    freq = Counter(lengths)
+    xs = sorted(freq.keys())
+    ys = [freq[x] for x in xs]
+
+    plt.figure(figsize=(10, 5))
+    plt.bar(xs, ys, width=max(1, (xs[-1] - xs[0]) / (len(xs) * 2)))
+    plt.xlabel("Length (chars)")
+    plt.ylabel("Frequency")
+    plt.title(f"Trace Length Distribution ({len(lengths)} traces)")
+    plt.tight_layout()
+    plot_path = jsonl_path.replace(".jsonl", "_lengths.png")
+    plt.savefig(plot_path)
+    plt.close()
+    print(f"Bar chart saved to {plot_path}")
+
 if __name__ == "__main__":
     print("Loading model for Engine Test...")
     model = LocalVLLMModel(model_path=BASE_MODEL)
     
     engine = RecursiveEngine(
         base_model=model,
-        max_workers=4,      # Small pool for testing
-        max_depth=2,        # Keep trees shallow
-        max_call=15
+        max_workers=64,
+        max_depth=5,        
+        max_call=50
     )
 
-    test_prompt = "Calculate the derivative of x^2 * sin(x) step by step."
+    test_prompt = "Calculate the second derivative of x^2 * sin(x) step by step."
     batch_output = "results/test_batch.jsonl"
     cont_output = "results/test_continuation.jsonl"
 
@@ -51,7 +70,7 @@ if __name__ == "__main__":
     # TEST 1: Parallel Batch Generation
     # ---------------------------------------------------------
     print("\n[TEST 1] Running Parallel Batch Generation...")
-    prompts = [test_prompt] * 4  # Generate 4 parallel traces
+    prompts = [test_prompt] * 64  # Generate 4 parallel traces
     engine.process_batch(prompts, output_jsonl_path=batch_output)
     
     # ---------------------------------------------------------
