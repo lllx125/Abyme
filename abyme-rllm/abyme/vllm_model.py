@@ -142,7 +142,7 @@ class LocalVLLMModel(Model):
             dtype="bfloat16",          
             max_num_seqs=256,          
             enforce_eager=True,           
-            enable_chunked_prefill=False,       
+            enable_chunked_prefill=True,       
             trust_remote_code=True,
             enable_lora=True if lora_path else False,   
             max_loras=1 if lora_path else None,         

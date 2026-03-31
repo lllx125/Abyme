@@ -15,7 +15,7 @@ import os
 
 from abyme.magic import magic_formatter
 from abyme.recursive_engine import RecursiveEngine
-from abyme.tree_trace import TreeTraceNode, dict_to_node, length
+from abyme.tree_trace import TreeTraceNode, dict_to_node, length, future_length
 from abyme.utils import verify_output_format_strict
 from abyme.vllm_model import LocalVLLMModel
 from benchmark.math_full_benchmark import MATHFullBenchmark
@@ -34,22 +34,6 @@ def _safe_verify_format(text: str) -> bool:
         return False
     return verify_output_format_strict(text)
 
-def _calculate_future_length(final_root: TreeTraceNode, first_node: TreeTraceNode) -> float:
-    path_indices = []
-    curr = first_node
-    while curr.parent is not None:
-        path_indices.append(curr.index)
-        curr = curr.parent
-    path_indices.reverse()
-
-    end_node = final_root
-    for idx in path_indices:
-        end_node = end_node.subproblems[idx]
-
-    end_len = length(end_node)
-    past_len = length(first_node.past[-1]) if first_node.past else 0.0
-    return float(end_len - past_len)
-
 def _compute_advantages(final_roots: List[TreeTraceNode], first_nodes: List[TreeTraceNode], correctness: List[bool], alpha: float) -> List[float]:
     print("      [Debug] Starting _compute_advantages...")
     sys.stdout.flush()
@@ -66,7 +50,7 @@ def _compute_advantages(final_roots: List[TreeTraceNode], first_nodes: List[Tree
         print("Done.")
         sys.stdout.flush()
 
-    lengths = [_calculate_future_length(end_n, fn) for end_n, fn in zip(final_roots, first_nodes)]
+    lengths = [future_length(end_n, fn) for end_n, fn in zip(final_roots, first_nodes)]
     
     correct_valid_lengths = [l for l, c, fi in zip(lengths, correctness, f) if c and fi == 1.0]
     mu_l = (sum(correct_valid_lengths) / len(correct_valid_lengths)) if correct_valid_lengths else (
@@ -98,7 +82,7 @@ def _pick_reference_index(final_roots: List[TreeTraceNode], first_nodes: List[Tr
         is_valid = _safe_verify_format(n.output)
         f.append(1.0 if is_valid else 0.0)
         
-    lengths = [_calculate_future_length(end_n, fn) for end_n, fn in zip(final_roots, first_nodes)]
+    lengths = [future_length(end_n, fn) for end_n, fn in zip(final_roots, first_nodes)]
 
     candidates = [(i, lengths[i]) for i in range(len(final_roots)) if correctness[i] and f[i] == 1.0]
     
@@ -298,13 +282,18 @@ class DataManager(MATHFullBenchmark):
         valid_lengths = []
         for end_n, fn, c in zip(final_roots, first_nodes, correctness):
             if c and _safe_verify_format(fn.output):
-                valid_lengths.append(_calculate_future_length(end_n, fn))
+                valid_lengths.append(future_length(end_n, fn))
 
         if valid_lengths:
             avg_len = sum(valid_lengths) / len(valid_lengths)
             print(f"    [Root Generation] Valid Future Lengths -> Max: {max(valid_lengths):.1f} | Min: {min(valid_lengths):.1f} | Avg: {avg_len:.2f}")
         else:
             print("    [Root Generation] No valid (correct + correct format) traces found for length tracking.")
+
+        any_success = any(c and _safe_verify_format(fn.output) for c, fn in zip(correctness, first_nodes))
+        if not any_success:
+            print("    [Skip] All root generations failed (wrong answer or invalid format). Skipping this problem entirely.")
+            return
 
         self._write_group(final_roots, first_nodes, correctness, output_path, file_lock)
 
@@ -313,7 +302,7 @@ class DataManager(MATHFullBenchmark):
         ref_first_node = first_nodes[ref_idx]
         
         has_subprobs = len(_ordered_nodes(ref_final_root)) > 1
-        ref_len = _calculate_future_length(ref_final_root, ref_first_node)
+        ref_len = future_length(ref_final_root, ref_first_node)
         
         print(f"    [Reference] Selected root index: {ref_idx} (correct: {correctness[ref_idx]}, length: {ref_len:.1f}, has_subproblems: {has_subprobs})")
 
@@ -330,7 +319,7 @@ class DataManager(MATHFullBenchmark):
 
         for list_idx, node in enumerate(nodes_to_process[1:], start=1):
             
-            future_len = _calculate_future_length(ref_final_root, node)
+            future_len = future_length(ref_final_root, node)
             
             print(f"\n    {'-'*60}")
             print(f"    >>> Continuing from Node #{list_idx}/{len(nodes_to_process)-1} (Depth: {node.depth}, Index: {node.index})")
@@ -390,7 +379,7 @@ class DataManager(MATHFullBenchmark):
         valid_lengths = []
         for end_n, fn, c in zip(final_roots, first_nodes, correctness):
             if c and _safe_verify_format(fn.output):
-                valid_lengths.append(_calculate_future_length(end_n, fn))
+                valid_lengths.append(future_length(end_n, fn))
 
         if valid_lengths:
             avg_len = sum(valid_lengths) / len(valid_lengths)

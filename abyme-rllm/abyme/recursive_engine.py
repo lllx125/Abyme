@@ -45,7 +45,7 @@ class RecursiveEngine(Model):
         guard_model: Optional[Model] = None,
         max_workers: int = 64,
         max_depth: int = 5,
-        max_call: int = 1000,
+        max_call: int = 10,
         max_subproblem_retry: int = 2,
         max_chain_length: int = 5,
         proceed_when_fail: bool = True,
@@ -150,21 +150,9 @@ class RecursiveEngine(Model):
         output_jsonl_path: str,
         max_attempt: int = 1
     ) -> List[Dict[str, Any]]:
-        """
-        Process a list of prompts with a shared worker pool.
-
-        Results are written to output_jsonl_path as each tree finishes (streaming).
-        Each line contains: index, prompt, status, output, metrics, trace_tree, first_generated_node.
-
-        Args:
-            prompts: Input prompts
-            output_jsonl_path: Path to write JSONL results
-            max_attempt: Retry attempts per node
-
-        Returns:
-            List of result dicts (same content as the JSONL file)
-        """
+        
         from pathlib import Path
+        import sys
 
         output_path = Path(output_jsonl_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,6 +161,11 @@ class RecursiveEngine(Model):
         file_lock = threading.Lock()
 
         print(f"Batch: {len(prompts)} prompts | {self.max_workers} shared workers | max_call={self.max_call}")
+        
+        # Reserve blank lines in the terminal (N-1 to prevent bottom-scrolling)
+        if len(prompts) > 1:
+            sys.stdout.write("\n" * (len(prompts) - 1))
+            sys.stdout.flush()
 
         manager = GlobalTaskManager(proceed_when_fail=self.proceed_when_fail)
 
@@ -180,36 +173,60 @@ class RecursiveEngine(Model):
             root = TreeTraceNode(prompt=prompt, fragment="", index=0)
             manager.register_tree(f"tree_{i}", root, max_call=self.max_call)
 
-        # Launch worker pool in background threads
-        completed_count = [0]  # mutable int in closure
-
         def on_tree_done(tree_id: str, idx: int):
             root = manager.get_tree_root(tree_id)
             result = self._build_result(idx, prompts[idx], root)
             with file_lock:
                 with output_path.open('a') as f:
                     f.write(json.dumps(result) + '\n')
-            completed_count[0] += 1
-            status = "✅" if root.status == "FINAL" else "❌"
-            print(f"  [{completed_count[0]}/{len(prompts)}] {status} tree_{idx} in {parallel_latency(root):.3f}s")
 
-        # Watcher thread: fires on_tree_done as each tree's Event becomes set.
-        # Clears tree_done_event before polling so a completion that races with
-        # the poll is never missed — worst case we loop one extra time.
         def watcher():
             pending = list(range(len(prompts)))
             while pending:
                 manager.tree_done_event.clear()
+                
+                # Move cursor UP to the start of the block
+                if len(prompts) > 1:
+                    sys.stdout.write(f"\r\033[{len(prompts) - 1}A")
+                else:
+                    sys.stdout.write("\r")
+                
                 still_pending = []
-                for idx in pending:
+                output_lines = []
+                
+                for idx in range(len(prompts)):
                     tid = f"tree_{idx}"
-                    if manager.is_tree_finished(tid):
-                        on_tree_done(tid, idx)
-                    else:
+                    tree_manager = manager.trees.get(tid)
+                    
+                    if tree_manager is None:
+                        line = f"Tree {idx:03d}: ⏳ Waiting..."
                         still_pending.append(idx)
+                    elif manager.is_tree_finished(tid):
+                        root = manager.get_tree_root(tid)
+                        calls = tree_manager.call_count
+                        if root.status == "FINAL":
+                            line = f"Tree {idx:03d}: ✅ SUCCESS ({calls} calls)"
+                        else:
+                            line = f"Tree {idx:03d}: ❌ FAILED ({calls} calls) [{root.error_message}]"
+                        
+                        if idx in pending:
+                            on_tree_done(tid, idx)
+                    else:
+                        calls = tree_manager.call_count
+                        line = f"Tree {idx:03d}: 🏃 RUNNING ({calls} calls)"
+                        still_pending.append(idx)
+                        
+                    # Add line to array, ensuring the terminal line is cleared first
+                    output_lines.append(f"\033[K{line}")
+                    
+                # Print all lines at once, joined by newline (NO trailing newline at the end)
+                sys.stdout.write("\n".join(output_lines))
+                sys.stdout.flush()
+                
                 pending = still_pending
+                
                 if pending:
-                    manager.wait_for_any_tree_done(timeout=0.5)
+                    manager.wait_for_any_tree_done(timeout=0.1)
 
         watcher_thread = threading.Thread(target=watcher, daemon=True)
         watcher_thread.start()
@@ -217,6 +234,9 @@ class RecursiveEngine(Model):
         self._run_pool(manager, max_attempt, wait_for=None)
         manager.wait_for_all_trees()
         watcher_thread.join()
+
+        # Output a final newline so the prompt doesn't overwrite the last tree
+        print() 
 
         # Read back results in order
         results = []
@@ -258,6 +278,7 @@ class RecursiveEngine(Model):
             List of result dicts sorted by index (same content as the JSONL)
         """
         from pathlib import Path
+        import sys
 
         if isinstance(source_nodes, TreeTraceNode):
             source_nodes = [source_nodes]
@@ -268,16 +289,19 @@ class RecursiveEngine(Model):
 
         file_lock = threading.Lock()
         all_results: List[Dict[str, Any]] = []
-        completed_count = [0]
 
         print(f"Continuing {len(source_nodes)} node(s) | group_size={group_size} | {self.max_workers} workers")
 
         for group_start in range(0, len(source_nodes), group_size):
             group = source_nodes[group_start : group_start + group_size]
+            
+            # Reserve space for just this group's UI
+            if len(group) > 1:
+                sys.stdout.write("\n" * (len(group) - 1))
+                sys.stdout.flush()
 
             manager = GlobalTaskManager(proceed_when_fail=self.proceed_when_fail)
 
-            # Build (tree_id -> original source_node) map for this group
             source_map: Dict[str, TreeTraceNode] = {}
             for local_idx, src in enumerate(group):
                 global_idx = group_start + local_idx
@@ -293,25 +317,51 @@ class RecursiveEngine(Model):
                     with output_path.open("a") as f:
                         f.write(json.dumps(result) + "\n")
                     all_results.append(result)
-                completed_count[0] += 1
-                status = "✅" if root.status == "FINAL" else "❌"
-                print(f"  [{completed_count[0]}/{len(source_nodes)}] {status} continue_{global_idx}")
 
             def watcher():
                 pending = list(range(len(group)))
                 while pending:
                     manager.tree_done_event.clear()
+                    
+                    if len(group) > 1:
+                        sys.stdout.write(f"\r\033[{len(group) - 1}A")
+                    else:
+                        sys.stdout.write("\r")
+                    
                     still_pending = []
-                    for local_idx in pending:
+                    output_lines = []
+                    
+                    for local_idx in range(len(group)):
                         global_idx = group_start + local_idx
                         tree_id = f"continue_{global_idx}"
-                        if manager.is_tree_finished(tree_id):
-                            on_tree_done(tree_id, global_idx, source_map[tree_id])
-                        else:
+                        tree_manager = manager.trees.get(tree_id)
+                        
+                        if tree_manager is None:
+                            line = f"Node {global_idx:03d}: ⏳ Waiting..."
                             still_pending.append(local_idx)
+                        elif manager.is_tree_finished(tree_id):
+                            root = manager.get_tree_root(tree_id)
+                            calls = tree_manager.call_count
+                            if root.status == "FINAL":
+                                line = f"Node {global_idx:03d}: ✅ SUCCESS ({calls} calls)"
+                            else:
+                                line = f"Node {global_idx:03d}: ❌ FAILED ({calls} calls)"
+                                
+                            if local_idx in pending:
+                                on_tree_done(tree_id, global_idx, source_map[tree_id])
+                        else:
+                            calls = tree_manager.call_count
+                            line = f"Node {global_idx:03d}: 🏃 RUNNING ({calls} calls)"
+                            still_pending.append(local_idx)
+                            
+                        output_lines.append(f"\033[K{line}")
+                        
+                    sys.stdout.write("\n".join(output_lines))
+                    sys.stdout.flush()
                     pending = still_pending
+                    
                     if pending:
-                        manager.wait_for_any_tree_done(timeout=0.5)
+                        manager.wait_for_any_tree_done(timeout=0.1)
 
             watcher_thread = threading.Thread(target=watcher, daemon=True)
             watcher_thread.start()
@@ -319,6 +369,8 @@ class RecursiveEngine(Model):
             self._run_pool(manager, max_attempt, wait_for=None)
             manager.wait_for_all_trees()
             watcher_thread.join()
+            
+            print() # Print a final newline before the next group starts
 
         all_results.sort(key=lambda r: r["index"])
         return all_results

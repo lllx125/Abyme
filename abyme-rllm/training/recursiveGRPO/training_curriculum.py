@@ -10,6 +10,8 @@ import multiprocessing as mp
 from typing import List, Dict, Any
 from training.notifier import mailman
 from data_generation import DataManager
+import traceback
+import sys
 
 # ==========================================
 # CONFIGURATION
@@ -20,26 +22,48 @@ HUB_REPO_PREFIX = "Lixing-Li/Abyme_GRPO_Iteration_"
 
 CHECKPOINT_INTERVAL = 20 
 GROUP_SIZE = 64
-MAX_WORKERS = 64
+MAX_WORKERS = 50
+
+# recusive arg
+MAX_CALL = 20
+MAX_DEPTH = 5
+MAX_CHAIN_LENGTH = 5
 
 # hyperparameters
-TEMPERATURE = 0.1
+TEMPERATURE = 0.05
 ALPHA = 1.0
+
+manager = DataManager(group_size=GROUP_SIZE, temperature=TEMPERATURE, alpha=ALPHA)
 
 # ==========================================
 # PROCESS ISOLATION WRAPPERS
 # ==========================================
+
+
+def _error_catching_wrapper(func, error_queue, *args, **kwargs):
+    """
+    Wraps target functions to catch exceptions and pass the full 
+    traceback string back to the main process via a queue.
+    """
+    try:
+        func(*args, **kwargs)
+    except Exception as e:
+        # Capture the full traceback string
+        tb_str = traceback.format_exc()
+        # Put the traceback into the queue for the main process
+        error_queue.put(tb_str)
+        # Exit forcefully so the main process registers exitcode != 0
+        sys.exit(1)
+
+
 def _generate_data_process(problem: Dict[str, Any], output_file: str, base_model: str, adapter_dir: str):
     from pathlib import Path
     from abyme.vllm_model import LocalVLLMModel
     from abyme.recursive_engine import RecursiveEngine
     
-    # Instantiate a stateless manager just for generation
-    manager = DataManager(group_size=GROUP_SIZE)
-    
     has_adapter = os.path.exists(adapter_dir)
     model = LocalVLLMModel(model_path=base_model, lora_path=adapter_dir if has_adapter else None)
-    engine = RecursiveEngine(base_model=model, max_workers=MAX_WORKERS)
+    engine = RecursiveEngine(base_model=model, max_workers=MAX_WORKERS, max_depth=MAX_DEPTH, max_call=MAX_CALL, max_chain_length=MAX_CHAIN_LENGTH)
 
     path = Path(output_file)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,7 +181,6 @@ def _checkpoint_process(base_model: str, adapter_dir: str, iteration: int):
     print(f"\nTesting {hub_repo_id} on the official test set...")
 
     # Reload the exact 50-per-level test set from disk
-    manager = DataManager(temperature=TEMPERATURE, group_size=GROUP_SIZE, alpha=ALPHA)
     test_data = manager.load_test_set()
 
     model = LocalVLLMModel(model_path=hub_repo_id)
@@ -166,8 +189,9 @@ def _checkpoint_process(base_model: str, adapter_dir: str, iteration: int):
         test_data=test_data,
         iteration=iteration,
         max_workers=MAX_WORKERS,
-        max_depth=5,
-        max_call=50
+        max_depth=MAX_DEPTH,
+        max_call=MAX_CALL,
+        max_chain_length=MAX_CHAIN_LENGTH
     )
     model.shutdown()
 
@@ -222,7 +246,7 @@ def run_curriculum(base_model: str = "Lixing-Li/Abyme-Qwen3.5-9B-SFT", starting_
 
         print(f"\n{'='*80}")
         mailman.send(f"TRAINING PROBLEM: {step+1}/{len(curriculum)}")
-        mailman.send(f"CHECKPOINT    : Iteration {iteration}")
+        print(f"CHECKPOINT    : Iteration {iteration}")
         print(f"TYPE          : {problem.get('type', '?')}")
         print(f"LEVEL         : {problem.get('level_num', '?')}")
         print(f"PROMPT        : {prompt_preview}")
@@ -230,35 +254,63 @@ def run_curriculum(base_model: str = "Lixing-Li/Abyme-Qwen3.5-9B-SFT", starting_
 
         step_data_file = f"results/step_data/step_{step}.jsonl"
 
+        # ==========================================
         # 1. GENERATE
-        p_gen = mp.Process(target=_generate_data_process, args=(problem, step_data_file, base_model, ADAPTER_DIR))
+        # ==========================================
+        error_queue = mp.Queue()
+        p_gen = mp.Process(
+            target=_error_catching_wrapper, 
+            args=(_generate_data_process, error_queue, problem, step_data_file, base_model, ADAPTER_DIR)
+        )
         p_gen.start()
         p_gen.join()
 
         if p_gen.exitcode != 0:
-            msg = f"[FATAL] Generation crashed at step {step}. Halting curriculum."
+            tb = error_queue.get() if not error_queue.empty() else "Unknown Error (No traceback captured)"
+            msg = f"[FATAL] Generation crashed at step {step}.\n\nTraceback:\n{tb}"
+            print(msg)
             mailman.send(msg)
             raise RuntimeError(msg)
 
+        if not os.path.exists(step_data_file) or os.path.getsize(step_data_file) == 0:
+            print(f"    [Skip] No valid data generated for step {step} (all generations failed). Skipping training.")
+            continue
+
+        # ==========================================
         # 2. TRAIN
-        p_train = mp.Process(target=_train_model_process, args=(base_model, step_data_file, ADAPTER_DIR))
+        # ==========================================
+        error_queue = mp.Queue()
+        p_train = mp.Process(
+            target=_error_catching_wrapper, 
+            args=(_train_model_process, error_queue, base_model, step_data_file, ADAPTER_DIR)
+        )
         p_train.start()
         p_train.join()
 
         if p_train.exitcode != 0:
-            msg = f"[FATAL] Training crashed at step {step}. Halting curriculum."
+            tb = error_queue.get() if not error_queue.empty() else "Unknown Error (No traceback captured)"
+            msg = f"[FATAL] Training crashed at step {step}.\n\nTraceback:\n{tb}"
+            print(msg)
             mailman.send(msg)
             raise RuntimeError(msg)
 
+        # ==========================================
         # 3. CHECKPOINT & TEST
+        # ==========================================
         if (step + 1) % CHECKPOINT_INTERVAL == 0:
             iteration += 1
-            p_check = mp.Process(target=_checkpoint_process, args=(base_model, ADAPTER_DIR, iteration))
+            error_queue = mp.Queue()
+            p_check = mp.Process(
+                target=_error_catching_wrapper, 
+                args=(_checkpoint_process, error_queue, base_model, ADAPTER_DIR, iteration)
+            )
             p_check.start()
             p_check.join()
 
             if p_check.exitcode != 0:
-                msg = f"[FATAL] Checkpoint {iteration} crashed. Halting curriculum."
+                tb = error_queue.get() if not error_queue.empty() else "Unknown Error (No traceback captured)"
+                msg = f"[FATAL] Checkpoint {iteration} crashed.\n\nTraceback:\n{tb}"
+                print(msg)
                 mailman.send(msg)
                 raise RuntimeError(msg)
 
@@ -272,6 +324,7 @@ def run_curriculum(base_model: str = "Lixing-Li/Abyme-Qwen3.5-9B-SFT", starting_
 if __name__ == "__main__":
     run_curriculum(
         #base_model="Lixing-Li/Abyme-Qwen3.5-9B-SFT", 
-        base_model="Lixing-Li/Abyme-Trained-Iteration-5",
-        starting_problem=0
+        #base_model="Lixing-Li/Abyme-Trained-Iteration-5",
+        base_model="Lixing-Li/Abyme_GRPO_Iteration_2",
+        starting_problem=43
     )

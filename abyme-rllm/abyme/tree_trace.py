@@ -501,31 +501,28 @@ def clone_trace_for_continuation(
 
 from typing import List
 
-def future_length(node: TreeTraceNode) -> int:
+def future_length(final_root: TreeTraceNode, node: TreeTraceNode) -> float:
     """ 
     Calculates the expected length from the current node to the end of its chain.
     future_length = current length + continuation length + subtree length
                   = end of the chain length - length of immediate past
     """
     
-    # 1. Find the "end of the chain" node
-    # Since continue_generation updates the parent's array in-place, 
-    # it always points to the latest temporal version of this node!
-    if node.parent is not None:
-        end_node = node.parent.subproblems[node.index]
+    # 1. Find the "end of the chain" node inside the final_root
+    if node.parent is None:
+        # Depth = 0: The end node is simply the final root itself.
+        end_node = final_root
     else:
-        # If it has no parent, it's the absolute root. 
-        # (Assuming the user passes the latest root if tracking the whole tree).
-        end_node = node
-        
+        end_node = node.parent.subproblems[node.index]
+                
     # 2. Get the total length of the final chain
     end_of_chain_length = length(end_node)
     
     # 3. Determine the "immediate past" nodes
     length_of_immediate_past = length(node.past[-1]) if node.past else 0.0
     
-    # 4. Apply the formula
-    return end_of_chain_length - length_of_immediate_past
+    # 4. Apply the formula (clamped to 0.0 to prevent negatives on pruned branches)
+    return max(0.0, float(end_of_chain_length - length_of_immediate_past))
 
 def draw_tree(
     node: TreeTraceNode, 

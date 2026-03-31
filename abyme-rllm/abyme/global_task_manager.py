@@ -109,11 +109,18 @@ class GlobalTaskManager:
 
                 # Enforce per-tree max_call limit
                 if best_manager.call_count >= best_manager.max_call:
-                    self.report_failure(
-                        best_tree_id,
-                        best_node,
-                        f"Maximum per-tree call count ({best_manager.max_call}) exceeded."
-                    )
+                    # HARD KILL: Abort the entire tree instantly instead of bubbling failures
+                    best_manager.root.cancel_tree()  # Cancels all pending subproblems
+                    best_manager.root.status = "FAILED" # Override root status
+                    best_manager.root.error_message = f"Maximum per-tree call count ({best_manager.max_call}) exceeded."
+                    best_manager.is_finished = True
+                    
+                    self.completion_events[best_tree_id].set()
+                    self.tree_done_event.set()
+                    if self._all_trees_done():
+                        self.all_finished = True
+                        
+                    self.worker_condition.notify_all()
                     continue  # Loop again to find the next best task from other trees
 
                 best_node.status = "GENERATING"
